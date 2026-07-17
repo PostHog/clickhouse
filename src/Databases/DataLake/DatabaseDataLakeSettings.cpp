@@ -46,6 +46,9 @@ namespace ErrorCodes
     DECLARE(String, dlf_access_key_id, "", "Access id of DLF token for Paimon REST Catalog", 0) \
     DECLARE(String, dlf_access_key_secret, "", "Access secret of DLF token for Paimon REST Catalog", 0) \
     DECLARE(Bool, polaris_style_paths, true, "Enable Polaris/ADLS Gen2 path convention: the container name is prepended to the path in ABFSS locations (e.g. abfss://c@account/c/actual/path). When enabled, the redundant container prefix is stripped when building Azure HTTPS URLs. Disable if a real directory inside the container has the same name as the container itself.", 0) \
+    DECLARE(String, ducklake_backend, "", "Catalog backend for DuckLake: 'postgres' or 'sqlite'", 0) \
+    DECLARE(String, ducklake_connection_string, "", "libpq conninfo string (postgres) or database file path (sqlite, relative to the user_files directory) for the DuckLake catalog", 0) \
+    DECLARE(String, ducklake_catalog_schema, "public", "Schema containing the ducklake_* catalog tables (postgres only)", 0) \
 
 #define LIST_OF_DATABASE_ICEBERG_SETTINGS(M, ALIAS) \
     DATABASE_ICEBERG_RELATED_SETTINGS(M, ALIAS) \

@@ -432,6 +432,7 @@ enum class DatabaseDataLakeCatalogType : uint8_t
     ICEBERG_ONELAKE,
     ICEBERG_BIGLAKE,
     PAIMON_REST,
+    DUCKLAKE,
 };
 
 DECLARE_SETTING_ENUM(DatabaseDataLakeCatalogType)
