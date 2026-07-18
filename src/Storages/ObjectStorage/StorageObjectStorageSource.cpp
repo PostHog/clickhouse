@@ -27,6 +27,7 @@
 #include <Processors/Transforms/AddingDefaultsTransform.h>
 #include <Processors/Transforms/ExpressionTransform.h>
 #include <Processors/Transforms/ExtractColumnsTransform.h>
+#include <Processors/Transforms/FilterTransform.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/Cache/SchemaCache.h>
 #include <Storages/HivePartitioningUtils.h>
@@ -669,15 +670,135 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             initial_header = sample_header;
             schema_changed = true;
         }
-        auto filter_info = [&]()
+        /// Save stripped filters if we need to apply them as fallback FilterTransforms
+        /// later in the pipeline when the file format doesn't support PREWHERE.
+        FilterDAGInfoPtr stripped_row_level_filter;
+        PrewhereInfoPtr stripped_prewhere_info;
+
+        auto filter_info = [&]() -> FormatFilterInfoPtr
         {
-            if (!schema_changed)
-                return format_filter_info;
-            auto mapper = configuration->getColumnMapperForObject(object_info);
-            if (!mapper)
-                return format_filter_info;
-            return std::make_shared<FormatFilterInfo>(format_filter_info->filter_actions_dag, format_filter_info->context.lock(), mapper, format_filter_info->row_level_filter, format_filter_info->prewhere_info);
+            if (!format_filter_info)
+                return nullptr;
+
+            /// Check if the actual file format supports PREWHERE. For mixed-format data lake
+            /// tables (e.g. Iceberg with Parquet + ORC files), table-level PREWHERE support
+            /// may not match the individual file's format capabilities.
+            /// See https://github.com/ClickHouse/ClickHouse/issues/96829
+            const auto actual_format = object_info->getFileFormat().value_or(configuration->format);
+            const bool format_supports_prewhere =
+                FormatFactory::instance().checkIfFormatSupportsPrewhere(actual_format, context_, format_settings);
+
+            /// The data lake can require post-read filters for a file (e.g. DuckLake hive
+            /// partition constants are only materialized after reading).
+            const bool strip_filters = !format_supports_prewhere
+                || (object_info->data_lake_metadata && object_info->data_lake_metadata->force_post_read_filters);
+
+            /// Save filters for fallback FilterTransform when format doesn't support PREWHERE.
+            if (strip_filters)
+            {
+                if (format_filter_info->row_level_filter)
+                    stripped_row_level_filter = format_filter_info->row_level_filter;
+                if (format_filter_info->prewhere_info)
+                    stripped_prewhere_info = format_filter_info->prewhere_info;
+            }
+
+            if (schema_changed)
+            {
+                if (auto mapper = configuration->getColumnMapperForObject(object_info))
+                {
+                    /// `schema_changed` is true for real schema evolution (a schema-id
+                    /// mismatch: renamed / type-changed columns) AND for current-schema
+                    /// files that merely carry equality deletes. Strip the reader-side
+                    /// filters ONLY for the former: there the old-schema mapper resolves
+                    /// field-ids to the file's OLD names while PREWHERE / row-level filter
+                    /// reference the CURRENT names, so in-reader evaluation matches nothing
+                    /// (re-applied as fallback FilterTransforms after the schema transform
+                    /// renames the columns below). For equality-delete-only files
+                    /// (getSchemaTransformer() == null, no rename) the mapper already yields
+                    /// the current names, so keep the filters in the reader to preserve
+                    /// Parquet row-group / page pruning.
+                    const bool has_schema_transform
+                        = configuration->getSchemaTransformer(context_, object_info) != nullptr;
+                    if (!strip_filters && has_schema_transform)
+                    {
+                        if (format_filter_info->row_level_filter)
+                            stripped_row_level_filter = format_filter_info->row_level_filter;
+                        if (format_filter_info->prewhere_info)
+                            stripped_prewhere_info = format_filter_info->prewhere_info;
+                    }
+                    const bool keep_in_reader = !strip_filters && !has_schema_transform;
+                    return std::make_shared<FormatFilterInfo>(
+                        format_filter_info->filter_actions_dag, format_filter_info->context.lock(),
+                        mapper,
+                        keep_in_reader ? format_filter_info->row_level_filter : nullptr,
+                        keep_in_reader ? format_filter_info->prewhere_info : nullptr);
+                }
+            }
+
+            if (strip_filters)
+            {
+                /// Data lake files can carry their own ColumnMapper (e.g. DuckLake
+                /// name-mapped files matched by column name); prefer it over the
+                /// table-wide one.
+                if (auto object_mapper = configuration->getColumnMapperForObject(object_info))
+                    return std::make_shared<FormatFilterInfo>(
+                        format_filter_info->filter_actions_dag,
+                        format_filter_info->context.lock(),
+                        object_mapper,
+                        nullptr, nullptr);
+                return std::make_shared<FormatFilterInfo>(
+                    format_filter_info->filter_actions_dag,
+                    format_filter_info->context.lock(),
+                    format_filter_info->column_mapper,
+                    nullptr, nullptr);
+            }
+
+            /// Data lake files can carry their own ColumnMapper (e.g. DuckLake name-mapped
+            /// files matched by column name); swap it in when it differs from the
+            /// table-wide one.
+            if (auto object_mapper = configuration->getColumnMapperForObject(object_info);
+                object_mapper && object_mapper != format_filter_info->column_mapper)
+                return std::make_shared<FormatFilterInfo>(
+                    format_filter_info->filter_actions_dag,
+                    format_filter_info->context.lock(),
+                    object_mapper,
+                    format_filter_info->row_level_filter,
+                    format_filter_info->prewhere_info);
+
+            return format_filter_info;
         }();
+
+        /// When PREWHERE / row-level filter is stripped from `format_filter_info` (i.e. the
+        /// actual file format doesn't support PREWHERE), the format reader will not produce
+        /// the input columns of those filters in its output: `read_from_format_info.format_header`
+        /// was already adjusted by `updateFormatPrewhereInfo` to reflect the post-PREWHERE
+        /// schema, so the format reader treats columns referenced only by PREWHERE as
+        /// "consumed" and does not emit them. We need them in the block so the fallback
+        /// `FilterTransform`s further down can evaluate `c0 > 10` etc. Re-add any missing
+        /// input columns of the stripped DAGs to the reader's sample header.
+        ///
+        /// Skip this for the schema-changed path: there `initial_header` was set above to
+        /// the FULL underlying file schema (`sample_header` from `getInitialSchemaByPath`),
+        /// so all file-side columns — including the file-side counterparts of the filter
+        /// input columns — are already present and emitted by the reader. The schema
+        /// transform that runs below then renames/casts them to query-side names BEFORE
+        /// the fallback `FilterTransform`s run, so policies and `PREWHERE` evaluate
+        /// against the same names the query planner produced.
+        if (!schema_changed)
+        {
+            auto add_filter_inputs = [&](const ActionsDAG & dag)
+            {
+                for (const auto & required : dag.getRequiredColumns())
+                {
+                    if (!initial_header.has(required.name))
+                        initial_header.insert({required.type, required.name});
+                }
+            };
+            if (stripped_row_level_filter)
+                add_filter_inputs(stripped_row_level_filter->actions);
+            if (stripped_prewhere_info)
+                add_filter_inputs(stripped_prewhere_info->prewhere_actions);
+        }
 
         chassert(object_info->getObjectMetadata().has_value());
 
@@ -762,7 +883,25 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             /// FIXME: This is currently not done for the below case (configuration->getSchemaTransformer())
             /// because it is an iceberg case where transformer contains columns ids (just increasing numbers)
             /// which do not match requested_columns (while here requested_columns were adjusted to match physical columns).
-            schema_transform->removeUnusedActions(read_from_format_info.requested_columns.getNames());
+            /// Preserve filter-input columns through the data lake schema transform. The
+            /// fallback `FilterTransform`s below evaluate against query-side names, so the
+            /// schema transform must keep any column referenced by the stripped filters,
+            /// not just those in `requested_columns` (post-`PREWHERE`, excludes filter inputs).
+            /// The transform produces whole columns, so keep top-level names here:
+            /// removeUnusedActions throws on subcolumn names like `s.x` (extracted later).
+            Names needed_names;
+            for (const auto & requested_column : read_from_format_info.requested_columns)
+                needed_names.push_back(requested_column.name.substr(0, requested_column.name.find('.')));
+            auto add_filter_required_names = [&needed_names](const ActionsDAG & dag)
+            {
+                for (const auto & required : dag.getRequiredColumns())
+                    needed_names.push_back(required.name.substr(0, required.name.find('.')));
+            };
+            if (stripped_row_level_filter)
+                add_filter_required_names(stripped_row_level_filter->actions);
+            if (stripped_prewhere_info)
+                add_filter_required_names(stripped_prewhere_info->prewhere_actions);
+            schema_transform->removeUnusedActions(needed_names);
         }
         if (!schema_transform)
         {
@@ -777,6 +916,39 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             builder.addSimpleTransform([&](const SharedHeader & header)
             {
                 return std::make_shared<ExpressionTransform>(header, schema_modifying_actions);
+            });
+        }
+
+        /// Apply row-level security filter and `PREWHERE` as fallback `FilterTransform`s
+        /// when they were stripped from `format_filter_info` above (the file format doesn't
+        /// support PREWHERE, or the data lake requires post-read filters, e.g. DuckLake hive
+        /// partition constants materialized only after reading).
+        ///
+        /// These transforms run AFTER the schema_transform `ExpressionTransform` above so the
+        /// block they see uses query-side column names. Row-level filter first, `PREWHERE`
+        /// second — the canonical order everywhere else in the engine (`PREWHERE` actions may
+        /// drop input columns a row policy still references).
+        if (stripped_row_level_filter)
+        {
+            auto row_level_actions = std::make_shared<ExpressionActions>(stripped_row_level_filter->actions.clone());
+            builder.addSimpleTransform([&](const SharedHeader & header)
+            {
+                return std::make_shared<FilterTransform>(
+                    header, row_level_actions,
+                    stripped_row_level_filter->column_name,
+                    stripped_row_level_filter->do_remove_column);
+            });
+        }
+
+        if (stripped_prewhere_info)
+        {
+            auto prewhere_actions = std::make_shared<ExpressionActions>(stripped_prewhere_info->prewhere_actions.clone());
+            builder.addSimpleTransform([&](const SharedHeader & header)
+            {
+                return std::make_shared<FilterTransform>(
+                    header, prewhere_actions,
+                    stripped_prewhere_info->prewhere_column_name,
+                    stripped_prewhere_info->remove_prewhere_column);
             });
         }
 

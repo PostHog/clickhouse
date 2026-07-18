@@ -26,8 +26,13 @@ public:
     /// even if the whole tuple was requested, because the names of the fields may be different.
     void setStorageColumnEncoding(std::unordered_map<String, Int64> && storage_encoding_);
 
+    /// Dotted parquet-side column path -> clickhouse dotted column name, for files whose
+    /// columns lack field ids and are matched by name (DuckLake name mappings).
+    void setStorageColumnNameMapping(std::unordered_map<String, String> && name_mapping_);
+
     const std::unordered_map<String, Int64> & getStorageColumnEncoding() const { return storage_encoding; }
     const std::unordered_map<Int64, String> & getFieldIdToClickHouseName() const { return field_id_to_clickhouse_name; }
+    const std::unordered_map<String, String> & getStorageColumnNameMapping() const { return storage_name_mapping; }
 
     /// clickhouse_column_name -> format_column_name (just join the maps above by field_id).
     std::pair<std::unordered_map<String, String>, std::unordered_map<String, String>> makeMapping(const std::unordered_map<Int64, String> & format_encoding);
@@ -35,6 +40,7 @@ public:
 private:
     std::unordered_map<String, Int64> storage_encoding;
     std::unordered_map<Int64, String> field_id_to_clickhouse_name;
+    std::unordered_map<String, String> storage_name_mapping;
 };
 
 using ColumnMapperPtr = std::shared_ptr<ColumnMapper>;
