@@ -49,7 +49,7 @@ SETTINGS allow_experimental_export_merge_tree_part = 1
 
 Source and destination tables must be 100% compatible:
 
-1. **Identical schemas** - same columns, types, and order
+1. **Identical schemas** - same columns, types, and order, matched positionally like `INSERT INTO dest SELECT * FROM src`. By default the source and destination must also have the same number of columns; a source with extra trailing columns can be allowed via `export_merge_tree_part_schema_mismatch_mode`.
 2. **Matching partition keys** - partition expressions must be identical
 
 In case a table function is used as the destination, the schema can be omitted and it will be inferred from the source table.
@@ -116,6 +116,16 @@ In case a table function is used as the destination, the schema can be omitted a
   When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform — the same computation the exported data files use. This keeps the Iceberg metadata consistent with the data files.
 
   **Warning:** A lossy cast on a partition column remains semantically truncating. For example, if a table is partitioned by an `Int64` column and some partition values do not fit into a destination `Int32` partition column, both the data files and the Iceberg metadata will contain the truncated `Int32` value (they agree with each other, but the original `Int64` value is lost). Such casts require `export_merge_tree_part_allow_lossy_cast = 1`.
+
+### `export_merge_tree_part_schema_mismatch_mode` (Optional)
+
+- **Type**: `MergeTreePartExportSchemaMismatchMode`
+- **Default**: `strict`
+- **Description**: Controls whether `EXPORT PART`/`EXPORT PARTITION` allows a column-count mismatch between the source `MergeTree` table and the destination table. Columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Possible values:
+  - `strict` - the source and destination must have the same number of columns. A mismatch in either direction throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+  - `ignore_extra_source_columns_by_position` - the source may have more columns than the destination. The extra trailing source columns (by position) are dropped and not exported. The destination having more columns than the source is still rejected in this mode.
+
+  The extra trailing source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part.
 
 
 ## Examples

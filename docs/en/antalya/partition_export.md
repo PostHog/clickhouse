@@ -120,6 +120,16 @@ Notes:
 
   **Warning:** A lossy cast on a partition column remains semantically truncating. For example, if a table is partitioned by an `Int64` column and some partition values do not fit into a destination `Int32` partition column, both the data files and the Iceberg metadata will contain the truncated `Int32` value (they agree with each other, but the original `Int64` value is lost). Such casts require `export_merge_tree_part_allow_lossy_cast = 1`.
 
+### `export_merge_tree_part_schema_mismatch_mode` (Optional)
+
+- **Type**: `MergeTreePartExportSchemaMismatchMode`
+- **Default**: `strict`
+- **Description**: Controls whether `EXPORT PART`/`EXPORT PARTITION` allows a column-count mismatch between the source `MergeTree` table and the destination table. Columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Possible values:
+  - `strict` - the source and destination must have the same number of columns. A mismatch in either direction throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+  - `ignore_extra_source_columns_by_position` - the source may have more columns than the destination. The extra trailing source columns (by position) are dropped and not exported. The destination having more columns than the source is still rejected in this mode.
+
+  The extra trailing source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part.
+
 ## Examples
 
 ### Basic Export to S3
