@@ -97,6 +97,48 @@ struct DuckLakeInlinedDataTable
     Int64 schema_version;
 };
 
+/// One new data file to register in the catalog (DuckLakeCatalog::appendDataFiles).
+struct DuckLakeNewDataFile
+{
+    /// Per-column statistics of the file (ducklake_file_column_stats). Min/max are
+    /// serialized exactly like the values the read side parses (plain numbers, ISO
+    /// dates/timestamps, raw strings).
+    struct ColumnStats
+    {
+        Int64 column_id;
+        Int64 value_count;
+        Int64 null_count;
+        bool contains_nan;
+        std::optional<String> min_value;
+        std::optional<String> max_value;
+    };
+
+    /// Path relative to the table's data path (registered with path_is_relative = true).
+    String path;
+    Int64 record_count;
+    Int64 file_size_bytes;
+    std::vector<ColumnStats> column_stats;
+    /// Serialized partition values indexed by partition_key_index; empty for unpartitioned
+    /// tables.
+    std::vector<std::optional<String>> partition_values;
+};
+
+/// Thrown when a catalog commit loses the optimistic-concurrency race on ducklake_snapshot
+/// (another writer committed concurrently). Retryable: re-pin and redo the commit.
+class DuckLakeCommitConflictException : public Exception
+{
+public:
+    using Exception::Exception;
+};
+
+/// The table's partition spec visible at a snapshot: its partition_id and the fields
+/// sorted by partition_key_index. partition_id is nullopt when the table is unpartitioned.
+struct DuckLakeCurrentPartitionSpec
+{
+    std::optional<Int64> partition_id;
+    std::vector<DuckLakePartitionField> fields;
+};
+
 /// Everything DuckLakeMetadata needs to serve reads at one pinned snapshot.
 struct DuckLakeTableSnapshotInfo
 {
@@ -136,6 +178,25 @@ public:
     /// Whether the catalog backend is PostgreSQL (affects how inlined values are serialized:
     /// strings/blobs are bytea hex, booleans are t/f, timestamps are DuckDB text).
     bool isPostgres() const;
+
+    /// Whether this catalog accepts writes (PostgreSQL backend only; the catalog schema
+    /// version was validated at construction).
+    bool supportsWrites() const;
+
+    /// The partition spec of `table_id` visible at `snapshot_id` (partition_id nullopt when
+    /// the table has no partition spec there).
+    DuckLakeCurrentPartitionSpec getCurrentPartitionSpec(Int64 table_id, Int64 snapshot_id) const;
+
+    /// Atomically register `files` for `table_id` in one catalog transaction: a new
+    /// ducklake_snapshot row, ducklake_data_file / ducklake_file_column_stats /
+    /// ducklake_file_partition_value rows, ducklake_table_stats /
+    /// ducklake_table_column_stats updates and a ducklake_snapshot_changes entry.
+    /// Retries on optimistic-concurrency conflicts (DuckLakeCommitConflictException).
+    /// Returns the committed snapshot_id.
+    Int64 appendDataFiles(
+        Int64 table_id,
+        const std::optional<Int64> & partition_id,
+        const std::vector<DuckLakeNewDataFile> & files);
 
     /// Pin MAX(snapshot_id) and load schema + field-id map for one table.
     /// Throws if the table does not exist.

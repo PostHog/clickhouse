@@ -5,6 +5,7 @@
 
 #include <Databases/DataLake/DatabaseDataLake.h>
 #include <Databases/DataLake/DuckLakeCatalog.h>
+#include <Core/Settings.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <Formats/FormatSettings.h>
 #include <Interpreters/Context.h>
@@ -17,6 +18,7 @@
 #include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeInlinedValues.h>
 #include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakePositionalDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakePruning.h>
+#include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeWrites.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
 #include <Storages/ObjectStorage/StorageObjectStorageConfiguration.h>
 #include <Storages/SelectQueryInfo.h>
@@ -25,6 +27,11 @@
 
 namespace DB
 {
+
+namespace Setting
+{
+extern const SettingsBool allow_insert_into_ducklake;
+}
 
 namespace DataLakeStorageSetting
 {
@@ -38,6 +45,7 @@ namespace ErrorCodes
 extern const int BAD_ARGUMENTS;
 extern const int LOGICAL_ERROR;
 extern const int SUPPORT_IS_DISABLED;
+extern const int UNSUPPORTED_METHOD;
 }
 
 namespace
@@ -290,8 +298,7 @@ DataLakeMetadataPtr DuckLakeMetadata::create(
         std::move(storage_path));
 }
 
-void DuckLakeMetadata::createInitial(
-    const ObjectStoragePtr & /*object_storage*/,
+void DuckLakeMetadata::createInitial(    const ObjectStoragePtr & /*object_storage*/,
     const StorageObjectStorageConfigurationWeakPtr & /*configuration*/,
     const ContextPtr & /*local_context*/,
     const std::optional<ColumnsDescription> & /*columns*/,
@@ -304,6 +311,47 @@ void DuckLakeMetadata::createInitial(
     throw Exception(
         ErrorCodes::UNSUPPORTED_METHOD,
         "Creating DuckLake tables is not supported: the DuckLake integration is read-only");
+}
+
+bool DuckLakeMetadata::supportsWrites() const
+{
+    return catalog->isPostgres();
+}
+
+bool DuckLakeMetadata::supportsParallelInsert() const
+{
+    return catalog->isPostgres();
+}
+
+SinkToStoragePtr DuckLakeMetadata::write(    SharedHeader sample_block,
+    const StorageID & /*table_id_*/,
+    ObjectStoragePtr object_storage_,
+    StorageObjectStorageConfigurationPtr /*configuration_*/,
+    const std::optional<FormatSettings> & format_settings,
+    ContextPtr context,
+    std::shared_ptr<DataLake::ICatalog> /*catalog_*/)
+{
+    if (!context->getSettingsRef()[Setting::allow_insert_into_ducklake])
+        throw Exception(
+            ErrorCodes::SUPPORT_IS_DISABLED,
+            "Insert into DuckLake is in beta. To allow its usage, enable setting allow_insert_into_ducklake");
+    if (!catalog->isPostgres())
+        throw Exception(
+            ErrorCodes::UNSUPPORTED_METHOD,
+            "Writes to a DuckLake catalog are supported for the PostgreSQL backend only");
+
+    auto partition_spec = catalog->getCurrentPartitionSpec(table_id, snapshot_id);
+    return std::make_shared<DuckLakeStorageSink>(
+        object_storage_,
+        storage_table_path,
+        catalog,
+        table_id,
+        std::move(partition_spec),
+        column_types_by_id,
+        column_mapper,
+        format_settings,
+        std::move(sample_block),
+        std::move(context));
 }
 
 ObjectIterator DuckLakeMetadata::iterate(

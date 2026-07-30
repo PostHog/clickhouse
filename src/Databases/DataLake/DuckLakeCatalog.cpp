@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <functional>
 
 #if USE_SQLITE
 #include <Databases/SQLite/SQLiteUtils.h>
@@ -29,6 +30,8 @@ extern const int BAD_ARGUMENTS;
 extern const int SUPPORT_IS_DISABLED;
 extern const int SQLITE_ENGINE_ERROR;
 extern const int POSTGRESQL_CONNECTION_FAILURE;
+extern const int DUCKLAKE_CATALOG_ERROR;
+extern const int UNSUPPORTED_METHOD;
 }
 
 namespace
@@ -89,6 +92,20 @@ struct DuckLakeQueryResult
     std::vector<Row> rows;
 };
 
+class IDuckLakeConnection;
+
+/// One catalog transaction (write path). Statements execute inside the transaction;
+/// commit throws DuckLakeCommitConflictException when another writer committed a
+/// conflicting ducklake_snapshot row concurrently.
+class IDuckLakeTransaction
+{
+public:
+    virtual ~IDuckLakeTransaction() = default;
+
+    virtual DuckLakeQueryResult exec(const String & query) = 0;
+    virtual void commit() = 0;
+};
+
 class IDuckLakeConnection
 {
 public:
@@ -100,6 +117,10 @@ public:
 
     /// ducklake_* table reference including the catalog schema qualifier for postgres.
     virtual String qualified(const String & table) = 0;
+
+    /// Begin a catalog write transaction. The SQLite backend throws UNSUPPORTED_METHOD:
+    /// writes are supported for PostgreSQL catalogs only.
+    virtual std::unique_ptr<IDuckLakeTransaction> beginTransaction() = 0;
 };
 
 #if USE_SQLITE
@@ -173,6 +194,14 @@ public:
     }
 
     String qualified(const String & table) override { return quoteIdentifier(table); }
+
+    std::unique_ptr<IDuckLakeTransaction> beginTransaction() override
+    {
+        throw Exception(
+            ErrorCodes::UNSUPPORTED_METHOD,
+            "Writes to a DuckLake catalog are supported for the PostgreSQL backend only (sqlite catalog '{}')",
+            database_path);
+    }
 
 private:
     String database_path;
@@ -250,7 +279,11 @@ public:
         return fmt::format("{}.{}", quoteIdentifier(catalog_schema), quoteIdentifier(table));
     }
 
+    std::unique_ptr<IDuckLakeTransaction> beginTransaction() override;
+
 private:
+    friend class DuckLakePostgresTransaction;
+
     String conninfo;
     String catalog_schema;
     std::unique_ptr<pqxx::connection> connection;
@@ -262,6 +295,109 @@ private:
             connection = std::make_unique<pqxx::connection>(conninfo);
     }
 };
+
+/// Catalog write transaction over pqxx::work. Holds the connection's mutex for its whole
+/// lifetime: a commit is a short, fixed sequence of statements, so readers only ever wait
+/// for one commit.
+class DuckLakePostgresTransaction final : public IDuckLakeTransaction
+{
+public:
+    explicit DuckLakePostgresTransaction(DuckLakePostgresConnection & connection_)
+        : connection(connection_)
+        , lock(connection.mutex)
+    {
+        try
+        {
+            connection.ensureOpen();
+            work = std::make_unique<pqxx::work>(*connection.connection);
+        }
+        catch (const pqxx::broken_connection & e)
+        {
+            connection.connection.reset();
+            throw Exception(ErrorCodes::POSTGRESQL_CONNECTION_FAILURE, "DuckLake catalog connection broken: {}", e.what());
+        }
+        catch (const pqxx::sql_error & e)
+        {
+            throw Exception(ErrorCodes::DUCKLAKE_CATALOG_ERROR, "Failed to begin a DuckLake catalog transaction: {}", e.what());
+        }
+    }
+
+    DuckLakeQueryResult exec(const String & query) override
+    {
+        try
+        {
+            return convert(work->exec(query));
+        }
+        catch (const pqxx::sql_error & e)
+        {
+            throwConflictOrError(e, query);
+        }
+    }
+
+    void commit() override
+    {
+        try
+        {
+            work->commit();
+        }
+        catch (const pqxx::sql_error & e)
+        {
+            throwConflictOrError(e, "COMMIT");
+        }
+    }
+
+private:
+    DuckLakePostgresConnection & connection;
+    std::unique_lock<std::mutex> lock;
+    std::unique_ptr<pqxx::work> work;
+
+    static DuckLakeQueryResult convert(const pqxx::result & res)
+    {
+        DuckLakeQueryResult result;
+        result.column_names.reserve(res.columns());
+        for (pqxx::row::size_type i = 0; i < res.columns(); ++i)
+            result.column_names.emplace_back(res.column_name(i));
+        result.rows.reserve(res.size());
+        for (const auto & prow : res)
+        {
+            DuckLakeQueryResult::Row row;
+            row.reserve(prow.size());
+            for (const auto & field : prow)
+            {
+                if (field.is_null())
+                    row.emplace_back(std::nullopt);
+                else
+                    row.emplace_back(String(field.c_str()));
+            }
+            result.rows.push_back(std::move(row));
+        }
+        return result;
+    }
+
+    [[noreturn]] static void throwConflictOrError(const pqxx::sql_error & e, const String & query)
+    {
+        /// 23505 unique_violation: another writer inserted the same ducklake_snapshot id.
+        /// 40001 serialization_failure: lost a serializable race.
+        const String sqlstate = e.sqlstate();
+        if (sqlstate == "23505" || sqlstate == "40001")
+            throw DuckLakeCommitConflictException(
+                ErrorCodes::DUCKLAKE_CATALOG_ERROR,
+                "DuckLake catalog commit conflicted with a concurrent writer (sqlstate {}): {}",
+                sqlstate,
+                e.what());
+        throw Exception(
+            ErrorCodes::DUCKLAKE_CATALOG_ERROR,
+            "DuckLake catalog write failed (sqlstate {}). Error: {}. Query: {}",
+            sqlstate,
+            e.what(),
+            query);
+    }
+};
+
+std::unique_ptr<IDuckLakeTransaction> DuckLakePostgresConnection::beginTransaction()
+{
+    return std::make_unique<DuckLakePostgresTransaction>(*this);
+}
 
 #endif
 
@@ -363,6 +499,348 @@ DuckLakeCatalog::DuckLakeCatalog(
 }
 
 DuckLakeCatalog::~DuckLakeCatalog() = default;
+
+bool DuckLakeCatalog::supportsWrites() const
+{
+    return isPostgres();
+}
+
+DuckLakeCurrentPartitionSpec DuckLakeCatalog::getCurrentPartitionSpec(Int64 table_id, Int64 snapshot_id) const
+{
+    const auto info = connection->exec(fmt::format(
+        "SELECT partition_id FROM {} WHERE table_id = {} AND {}",
+        connection->qualified("ducklake_partition_info"),
+        table_id,
+        visibilityPredicate(snapshot_id, "ducklake_partition_info")));
+
+    DuckLakeCurrentPartitionSpec spec;
+    if (info.rows.empty())
+        return spec;
+
+    if (info.rows.size() != 1)
+        throw Exception(
+            ErrorCodes::DUCKLAKE_CATALOG_ERROR,
+            "DuckLake table (id {}) has {} partition specs visible at snapshot {}, expected at most one",
+            table_id,
+            info.rows.size(),
+            snapshot_id);
+    spec.partition_id = parseInt64(info.rows[0][0], "partition_id");
+
+    const auto fields = connection->exec(fmt::format(
+        "SELECT partition_key_index, column_id, transform FROM {} WHERE partition_id = {} AND table_id = {} "
+        "ORDER BY partition_key_index",
+        connection->qualified("ducklake_partition_column"),
+        *spec.partition_id,
+        table_id));
+    for (const auto & row : fields.rows)
+    {
+        spec.fields.push_back(DuckLakePartitionField{
+            .partition_key_index = parseInt64(row[0], "partition_key_index"),
+            .column_id = parseInt64(row[1], "column_id"),
+            .transform = row[2].value_or(""),
+        });
+    }
+    return spec;
+}
+
+namespace
+{
+
+String sqlInt64(Int64 value)
+{
+    return fmt::format("{}", value);
+}
+
+String sqlNullableString(const std::optional<String> & value)
+{
+    return value.has_value() ? quoteLiteral(*value) : String("NULL");
+}
+
+}
+
+Int64 DuckLakeCatalog::appendDataFiles(
+    Int64 table_id,
+    const std::optional<Int64> & partition_id,
+    const std::vector<DuckLakeNewDataFile> & files)
+{
+    if (files.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "No data files to register in the DuckLake catalog");
+    if (!supportsWrites())
+        throw Exception(
+            ErrorCodes::UNSUPPORTED_METHOD,
+            "Writes to a DuckLake catalog are supported for the PostgreSQL backend only");
+
+    Int64 total_records = 0;
+    Int64 total_bytes = 0;
+    for (const auto & file : files)
+    {
+        total_records += file.record_count;
+        total_bytes += file.file_size_bytes;
+    }
+
+    /// column_id -> type of every visible column, for type-aware stats comparisons below.
+    const auto column_rows = getColumnRows(table_id);
+    const auto column_tree = DuckLake::buildColumnTree(column_rows, pinSnapshot());
+    std::unordered_map<Int64, NameAndTypePair> column_types;
+    std::function<void(const DuckLake::ColumnNode &)> collect_types = [&](const DuckLake::ColumnNode & node)
+    {
+        column_types.emplace(node.info.column_id, NameAndTypePair(node.info.name, DuckLake::getColumnType(node)));
+        for (const auto & child : node.children)
+            collect_types(child);
+    };
+    for (const auto & root : column_tree)
+        collect_types(root);
+
+    /// Optimistic concurrency: two writers picking the same next snapshot id collide on the
+    /// ducklake_snapshot primary key; the loser retries the whole commit. The table_stats
+    /// row lock below serializes writers to the same table, so the retry only fires for
+    /// writes to *other* tables of the same catalog.
+    static constexpr size_t max_commit_attempts = 10;
+    for (size_t attempt = 0;; ++attempt)
+    {
+        try
+        {
+            auto transaction = connection->beginTransaction();
+
+            const auto snapshot_rows = transaction->exec(fmt::format(
+                "SELECT snapshot_id, schema_version, next_catalog_id, next_file_id FROM {} "
+                "ORDER BY snapshot_id DESC LIMIT 1",
+                connection->qualified("ducklake_snapshot")));
+            if (snapshot_rows.rows.empty())
+                throw Exception(ErrorCodes::DUCKLAKE_CATALOG_ERROR, "DuckLake catalog has no snapshots");
+            const auto & current = snapshot_rows.rows[0];
+            const Int64 new_snapshot_id = parseInt64(current[0], "snapshot_id") + 1;
+            const Int64 schema_version = parseInt64(current[1], "schema_version");
+            const Int64 next_catalog_id = parseInt64(current[2], "next_catalog_id");
+            const Int64 next_file_id = parseInt64(current[3], "next_file_id");
+
+            /// Lock the table's stats row for the rest of the transaction (serializes
+            /// concurrent writers to this table) and get the row id counter.
+            const auto stats_rows = transaction->exec(fmt::format(
+                "SELECT record_count, next_row_id, file_size_bytes FROM {} WHERE table_id = {} FOR UPDATE",
+                connection->qualified("ducklake_table_stats"),
+                table_id));
+            Int64 next_row_id = 0;
+            bool have_stats_row = !stats_rows.rows.empty();
+            if (have_stats_row)
+                next_row_id = stats_rows.rows[0][1].has_value() ? std::stoll(*stats_rows.rows[0][1]) : 0;
+
+            transaction->exec(fmt::format(
+                "INSERT INTO {} (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) "
+                "VALUES ({}, now(), {}, {}, {})",
+                connection->qualified("ducklake_snapshot"),
+                new_snapshot_id,
+                schema_version,
+                next_catalog_id,
+                next_file_id + files.size()));
+
+            Int64 row_id_start = next_row_id;
+            for (size_t i = 0; i < files.size(); ++i)
+            {
+                const auto & file = files[i];
+                const Int64 data_file_id = next_file_id + static_cast<Int64>(i);
+                transaction->exec(fmt::format(
+                    "INSERT INTO {} (data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path, "
+                    "path_is_relative, file_format, record_count, file_size_bytes, footer_size, row_id_start, "
+                    "partition_id, encryption_key, mapping_id, partial_max) "
+                    "VALUES ({}, {}, {}, NULL, NULL, {}, true, 'parquet', {}, {}, NULL, {}, {}, NULL, NULL, NULL)",
+                    connection->qualified("ducklake_data_file"),
+                    data_file_id,
+                    table_id,
+                    new_snapshot_id,
+                    quoteLiteral(file.path),
+                    file.record_count,
+                    file.file_size_bytes,
+                    row_id_start,
+                    partition_id.has_value() ? sqlInt64(*partition_id) : String("NULL")));
+                row_id_start += file.record_count;
+
+                if (!file.column_stats.empty())
+                {
+                    String query = fmt::format(
+                        "INSERT INTO {} (data_file_id, table_id, column_id, column_size_bytes, value_count, "
+                        "null_count, min_value, max_value, contains_nan, extra_stats) VALUES ",
+                        connection->qualified("ducklake_file_column_stats"));
+                    for (size_t j = 0; j < file.column_stats.size(); ++j)
+                    {
+                        const auto & stats = file.column_stats[j];
+                        if (j > 0)
+                            query += ", ";
+                        query += fmt::format(
+                            "({}, {}, {}, NULL, {}, {}, {}, {}, {}, NULL)",
+                            data_file_id,
+                            table_id,
+                            stats.column_id,
+                            stats.value_count,
+                            stats.null_count,
+                            sqlNullableString(stats.min_value),
+                            sqlNullableString(stats.max_value),
+                            stats.contains_nan ? "true" : "false");
+                    }
+                    transaction->exec(query);
+                }
+
+                for (size_t key_index = 0; key_index < file.partition_values.size(); ++key_index)
+                {
+                    transaction->exec(fmt::format(
+                        "INSERT INTO {} (data_file_id, table_id, partition_key_index, partition_value) "
+                        "VALUES ({}, {}, {}, {})",
+                        connection->qualified("ducklake_file_partition_value"),
+                        data_file_id,
+                        table_id,
+                        key_index,
+                        sqlNullableString(file.partition_values[key_index])));
+                }
+            }
+
+            if (have_stats_row)
+            {
+                transaction->exec(fmt::format(
+                    "UPDATE {} SET record_count = record_count + {}, next_row_id = next_row_id + {}, "
+                    "file_size_bytes = file_size_bytes + {} WHERE table_id = {}",
+                    connection->qualified("ducklake_table_stats"),
+                    total_records,
+                    total_records,
+                    total_bytes,
+                    table_id));
+            }
+            else
+            {
+                transaction->exec(fmt::format(
+                    "INSERT INTO {} (table_id, record_count, next_row_id, file_size_bytes) VALUES ({}, {}, {}, {})",
+                    connection->qualified("ducklake_table_stats"),
+                    table_id,
+                    total_records,
+                    total_records,
+                    total_bytes));
+            }
+
+            /// Widen the table-level column bounds so readers relying on
+            /// ducklake_table_column_stats stay correct. The comparison must be
+            /// type-aware (serialized stats values do not order lexicographically),
+            /// so it happens here rather than in SQL.
+            {
+                /// Merge the per-file stats of this commit into one bound per column.
+                struct NewColumnBounds
+                {
+                    bool has_any = false;
+                    bool contains_null = false;
+                    bool contains_nan = false;
+                    std::optional<String> min_value;
+                    std::optional<String> max_value;
+                };
+                std::map<Int64, NewColumnBounds> new_bounds;
+                for (const auto & file : files)
+                {
+                    for (const auto & stats : file.column_stats)
+                    {
+                        auto & bounds = new_bounds[stats.column_id];
+                        bounds.contains_null |= stats.null_count > 0;
+                        bounds.contains_nan |= stats.contains_nan;
+                        if (stats.min_value.has_value() && stats.max_value.has_value())
+                        {
+                            bounds.has_any = true;
+                            if (!bounds.min_value.has_value())
+                            {
+                                bounds.min_value = stats.min_value;
+                                bounds.max_value = stats.max_value;
+                                continue;
+                            }
+                            auto type_it = column_types.find(stats.column_id);
+                            if (type_it == column_types.end())
+                                continue;
+                            const auto new_min = DuckLake::parseStatsValue(*stats.min_value, type_it->second.type);
+                            const auto cur_min = DuckLake::parseStatsValue(*bounds.min_value, type_it->second.type);
+                            const auto new_max = DuckLake::parseStatsValue(*stats.max_value, type_it->second.type);
+                            const auto cur_max = DuckLake::parseStatsValue(*bounds.max_value, type_it->second.type);
+                            if (new_min.has_value() && cur_min.has_value() && *new_min < *cur_min)
+                                bounds.min_value = stats.min_value;
+                            if (new_max.has_value() && cur_max.has_value() && *cur_max < *new_max)
+                                bounds.max_value = stats.max_value;
+                        }
+                    }
+                }
+
+                const auto existing = transaction->exec(fmt::format(
+                    "SELECT column_id, contains_null, contains_nan, min_value, max_value FROM {} WHERE table_id = {}",
+                    connection->qualified("ducklake_table_column_stats"),
+                    table_id));
+                std::unordered_map<Int64, size_t> existing_row_by_column;
+                for (size_t i = 0; i < existing.rows.size(); ++i)
+                    existing_row_by_column.emplace(parseInt64(existing.rows[i][0], "column_id"), i);
+
+                for (const auto & [column_id, bounds] : new_bounds)
+                {
+                    std::optional<String> new_min = bounds.min_value;
+                    std::optional<String> new_max = bounds.max_value;
+                    const auto existing_it = existing_row_by_column.find(column_id);
+                    if (existing_it != existing_row_by_column.end())
+                    {
+                        const auto & row = existing.rows[existing_it->second];
+                        auto type_it = column_types.find(column_id);
+                        if (type_it != column_types.end())
+                        {
+                            if (row[3].has_value() && new_min.has_value())
+                            {
+                                const auto old_value = DuckLake::parseStatsValue(*row[3], type_it->second.type);
+                                const auto candidate = DuckLake::parseStatsValue(*new_min, type_it->second.type);
+                                if (old_value.has_value() && candidate.has_value() && !(*candidate < *old_value))
+                                    new_min = row[3];
+                            }
+                            if (row[4].has_value() && new_max.has_value())
+                            {
+                                const auto old_value = DuckLake::parseStatsValue(*row[4], type_it->second.type);
+                                const auto candidate = DuckLake::parseStatsValue(*new_max, type_it->second.type);
+                                if (old_value.has_value() && candidate.has_value() && !(*old_value < *candidate))
+                                    new_max = row[4];
+                            }
+                        }
+                        transaction->exec(fmt::format(
+                            "UPDATE {} SET min_value = {}, max_value = {}, contains_null = contains_null OR {}, "
+                            "contains_nan = contains_nan OR {} WHERE table_id = {} AND column_id = {}",
+                            connection->qualified("ducklake_table_column_stats"),
+                            sqlNullableString(new_min),
+                            sqlNullableString(new_max),
+                            bounds.contains_null ? "true" : "false",
+                            bounds.contains_nan ? "true" : "false",
+                            table_id,
+                            column_id));
+                    }
+                    else
+                    {
+                        transaction->exec(fmt::format(
+                            "INSERT INTO {} (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats) "
+                            "VALUES ({}, {}, {}, {}, {}, {}, NULL)",
+                            connection->qualified("ducklake_table_column_stats"),
+                            table_id,
+                            column_id,
+                            bounds.contains_null ? "true" : "false",
+                            bounds.contains_nan ? "true" : "false",
+                            sqlNullableString(new_min),
+                            sqlNullableString(new_max)));
+                    }
+                }
+            }
+
+            transaction->exec(fmt::format(
+                "INSERT INTO {} (snapshot_id, changes_made) VALUES ({}, {})",
+                connection->qualified("ducklake_snapshot_changes"),
+                new_snapshot_id,
+                quoteLiteral(fmt::format("inserted_into_table:{}", table_id))));
+
+            transaction->commit();
+            return new_snapshot_id;
+        }
+        catch (const DuckLakeCommitConflictException &)
+        {
+            if (attempt + 1 >= max_commit_attempts)
+                throw Exception(
+                    ErrorCodes::DUCKLAKE_CATALOG_ERROR,
+                    "DuckLake catalog commit kept conflicting with concurrent writers after {} attempts; retry the insert",
+                    max_commit_attempts);
+        }
+    }
+}
 
 DB::DatabaseDataLakeCatalogType DuckLakeCatalog::getCatalogType() const
 {

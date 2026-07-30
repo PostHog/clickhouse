@@ -511,3 +511,180 @@ def test_unsupported_catalog_version(started_cluster):
             " ducklake_connection_string = 'catalog_badversion.db';",
             settings={"allow_experimental_database_ducklake_catalog": 1},
         )
+
+WRITE_SETTINGS = {"allow_insert_into_ducklake": 1}
+
+
+def test_ducklake_write(started_cluster):
+    create_postgres_db()
+    db = "ducklake_pg"
+
+    # inserts are gated behind allow_insert_into_ducklake
+    with pytest.raises(QueryRuntimeException, match="allow_insert_into_ducklake"):
+        node.query("INSERT INTO `main.plain` VALUES (100, 'zzz')", database=db)
+
+    node.query(
+        "INSERT INTO `main.plain` VALUES (4, 'd'), (5, 'e')",
+        database=db,
+        settings=WRITE_SETTINGS,
+    )
+    assert (
+        node.query("SELECT * FROM `main.plain` ORDER BY id", database=db)
+        == "1\ta\n2\tb\n3\tc\n4\td\n5\te\n"
+    )
+
+    # a second insert is a second catalog commit; NULLs land in null_count, not min/max
+    node.query(
+        "INSERT INTO `main.plain` VALUES (6, 'f'), (7, NULL)",
+        database=db,
+        settings=WRITE_SETTINGS,
+    )
+    assert node.query("SELECT count() FROM `main.plain`", database=db) == "7\n"
+    assert (
+        node.query("SELECT * FROM `main.plain` WHERE id = 7", database=db) == "7\t\\N\n"
+    )
+
+    # min/max stats of the newly written files feed file pruning
+    node.query("SELECT count() FROM `main.plain` WHERE id < 4", database=db)
+    assert node.grep_in_log("DuckLake: pruned 2 of 3 files")
+    node.query("SELECT count() FROM `main.plain` WHERE id > 100", database=db)
+    assert node.grep_in_log("DuckLake: pruned 3 of 3 files")
+
+    # full scalar type round trip
+    node.query(
+        "INSERT INTO `main.evolved` VALUES (6, 6.5)",
+        database=db,
+        settings=WRITE_SETTINGS,
+    )
+    assert (
+        node.query("SELECT * FROM `main.evolved` WHERE id = 6", database=db) == "6\t6.5\n"
+    )
+
+    # writing tables with `time` columns is rejected with a clear error until the
+    # Parquet writer learns the Time type
+    with pytest.raises(QueryRuntimeException, match="no Time support"):
+        node.query(
+            "INSERT INTO `main.types` VALUES "
+            "(0, 10, -20, 30, -40, 99999, 11, 22, 33, 44, 3.5, 4.5, 56.78, 'hello', 'bin',"
+            " '2025-03-04', '12:00:00', '2025-03-04 12:00:00.123456', '2025-03-04 12:00:00.654321',"
+            " 'c2ffbc99-9c0b-4ef8-bb6d-6bb9bd380a33')",
+            database=db,
+            settings=WRITE_SETTINGS,
+        )
+
+    # scalar columns of the same table still round-trip
+    # (read path coverage for all types is in run_checks)
+    node.query(
+        "INSERT INTO `main.nested` VALUES (3, (7, 'w'), [4, 5], {'c': 3})",
+        database=db,
+        settings=WRITE_SETTINGS,
+    )
+    assert (
+        node.query("SELECT * FROM `main.nested` ORDER BY id", database=db)
+        == "1\t(1,'u')\t[1,2]\t{'a':1}\n2\t(2,'v')\t[3]\t{'b':2}\n3\t(7,'w')\t[4,5]\t{'c':3}\n"
+    )
+
+
+def test_ducklake_write_partitioned(started_cluster):
+    create_postgres2_db()
+    db = "ducklake_pg2"
+
+    # identity + year transforms; the new partition values prune all old files away
+    node.query(
+        "INSERT INTO `main.partitioned` VALUES ('d', '2025-01-15', 1000, 'new')",
+        database=db,
+        settings=WRITE_SETTINGS,
+    )
+    assert (
+        node.query("SELECT * FROM `main.partitioned` WHERE region = 'd'", database=db)
+        == "d\t2025-01-15\t1000\tnew\n"
+    )
+    node.query("SELECT count() FROM `main.partitioned` WHERE region = 'd'", database=db)
+    assert node.grep_in_log("DuckLake: pruned 6 of 7 files")
+    node.query(
+        "SELECT count() FROM `main.partitioned` WHERE year(dt) = 2025", database=db
+    )
+    assert node.grep_in_log("DuckLake: pruned 6 of 7 files")
+
+    # year/month/day transforms on a timestamptz column
+    node.query(
+        "INSERT INTO `main.partitioned_cal` VALUES ('2025-03-04 05:06:07.000000', 2000, 'cal')",
+        database=db,
+        settings=WRITE_SETTINGS,
+    )
+    assert (
+        node.query(
+            "SELECT * FROM `main.partitioned_cal` WHERE toYear(ts) = 2025", database=db
+        )
+        == "2025-03-04 05:06:07.000000\t2000\tcal\n"
+    )
+    node.query(
+        "SELECT count() FROM `main.partitioned_cal` WHERE toYear(ts) = 2025", database=db
+    )
+    assert node.grep_in_log("DuckLake: pruned 18 of 19 files")
+
+    # rows spanning several partitions of one insert land in one file per partition
+    node.query(
+        "INSERT INTO `main.partitioned` VALUES "
+        "('a', '2023-05-01', 2001, 'p1'), ('b', '2024-06-02', 2002, 'p2'), ('a', '2024-07-03', 2003, 'p3')",
+        database=db,
+        settings=WRITE_SETTINGS,
+    )
+    assert (
+        node.query("SELECT count() FROM `main.partitioned` WHERE id >= 2001", database=db)
+        == "3\n"
+    )
+    assert (
+        node.query(
+            "SELECT region, dt, id, val FROM `main.partitioned` WHERE id >= 2001 ORDER BY id",
+            database=db,
+        )
+        == "a\t2023-05-01\t2001\tp1\nb\t2024-06-02\t2002\tp2\na\t2024-07-03\t2003\tp3\n"
+    )
+
+
+def test_ducklake_write_sqlite_rejected(started_cluster):
+    create_sqlite_db()
+    with pytest.raises(QueryRuntimeException, match="Writes are not supported"):
+        node.query(
+            "INSERT INTO `main.plain` VALUES (100, 'zzz')",
+            database="ducklake_sqlite",
+            settings=WRITE_SETTINGS,
+        )
+
+
+def test_ducklake_write_concurrent(started_cluster):
+    import threading
+
+    create_postgres_db()
+    db = "ducklake_pg"
+    base = int(node.query("SELECT count() FROM `main.plain`", database=db))
+
+    errors = []
+
+    def insert(value):
+        try:
+            node.query(
+                f"INSERT INTO `main.plain` VALUES ({value}, 'cc{value}')",
+                database=db,
+                settings=WRITE_SETTINGS,
+            )
+        except Exception as e:
+            errors.append(e)
+
+    # two writers race on the same snapshot id; the loser's commit must retry and succeed
+    threads = [threading.Thread(target=insert, args=(5000 + i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert (
+        node.query("SELECT count() FROM `main.plain`", database=db)
+        == f"{base + 2}\n"
+    )
+    assert (
+        node.query("SELECT * FROM `main.plain` WHERE id >= 5000 ORDER BY id", database=db)
+        == "5000\tcc5000\n5001\tcc5001\n"
+    )

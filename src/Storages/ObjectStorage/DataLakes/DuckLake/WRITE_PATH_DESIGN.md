@@ -203,3 +203,24 @@ catch schema drift.
 3. `DuckLakeStorageSink` (unpartitioned first) + `DuckLakeMetadata::write` + setting gate.
 4. Partitioned writes.
 5. Integration tests.
+
+## 7. As-built notes (PR #2)
+
+- Hive directory keys follow DuckDB: the *transform* name for calendar transforms
+  (`year=2025/month=3/day=4`), the column name for identity transforms. Using the column
+  name for all keys produced duplicate-key paths (`ts=2025/ts=3/ts=4`) that hive-style
+  path parsing rejects.
+- One Parquet file per distinct partition key per INSERT statement (no size-based
+  rollover yet).
+- Stats are written for top-level scalar columns only (nested leaves are skipped;
+  readers tolerate missing stats). UInt8 stats are serialized numerically (`'0'`/`'1'`),
+  which the ClickHouse reader parses for both boolean and uint8 origins.
+- `footer_size` and `file_order` are registered as NULL; the read side does not use them.
+- Tables containing `time`/`time_ns` columns are rejected at write time with a clear
+  error: the ClickHouse Parquet writer has no `Time` support yet.
+- `bucket(N)` partition transforms are rejected at write time (identity, year, month,
+  day and hour are supported).
+- Concurrency: `ducklake_table_stats ... FOR UPDATE` serializes writers to the same
+  table; cross-table snapshot-id collisions hit the primary key and retry (up to 10
+  attempts).
+

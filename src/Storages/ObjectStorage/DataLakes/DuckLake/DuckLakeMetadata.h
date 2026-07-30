@@ -55,6 +55,18 @@ public:
 
     NamesAndTypesList getTableSchema(ContextPtr /*local_context*/) const override { return schema; }
 
+    bool supportsWrites() const override;
+    bool supportsParallelInsert() const override;
+
+    SinkToStoragePtr write(
+        SharedHeader sample_block,
+        const StorageID & table_id,
+        ObjectStoragePtr object_storage_,
+        StorageObjectStorageConfigurationPtr configuration_,
+        const std::optional<FormatSettings> & format_settings,
+        ContextPtr context,
+        std::shared_ptr<DataLake::ICatalog> catalog_) override;
+
     ObjectIterator iterate(
         const ActionsDAG * filter_dag,
         FileProgressCallback callback,

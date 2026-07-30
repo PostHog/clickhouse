@@ -40,38 +40,6 @@ namespace DB
 namespace DuckLake
 {
 
-std::optional<Field> parseStatsValue(const String & value, const DataTypePtr & type_)
-{
-    const auto type = removeNullable(type_);
-    const WhichDataType which(type);
-
-    if (which.isString() || which.isFixedString())
-        return Field(value);
-
-    /// DuckDB serializes booleans as 'true'/'false'; booleans are UInt8 in ClickHouse.
-    if (which.isUInt8() && (value == "true" || value == "false"))
-        return Field(UInt64(value == "true" ? 1 : 0));
-
-    if (!type->canBeInsideNullable())
-        return std::nullopt;
-
-    try
-    {
-        auto column = type->createColumn();
-        ReadBufferFromString buf(value);
-        FormatSettings format_settings;
-        type->getDefaultSerialization()->deserializeWholeText(*column, buf, format_settings);
-        if (!buf.eof() || column->empty())
-            return std::nullopt;
-        return column->operator[](0);
-    }
-    catch (...)
-    {
-        /// Unparseable for this type (e.g. timestamptz offsets): do not prune on it.
-        return std::nullopt;
-    }
-}
-
 namespace
 {
 

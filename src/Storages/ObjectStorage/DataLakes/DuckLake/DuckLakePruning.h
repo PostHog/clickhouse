@@ -23,11 +23,6 @@ struct DuckLakePartitionField;
 namespace DuckLake
 {
 
-/// Parse a DuckLake-serialized stats/partition value (plain numbers, ISO dates/timestamps,
-/// raw strings, DuckDB booleans) into a Field of `type`. Returns nullopt when the value
-/// cannot be parsed unambiguously for the type (caller must not prune on it).
-std::optional<Field> parseStatsValue(const String & value, const DataTypePtr & type);
-
 /// Closed interval of calendar bucket numbers (year, month 1-12 or day 1-31); unbounded
 /// sides are nullopt.
 struct BucketRange

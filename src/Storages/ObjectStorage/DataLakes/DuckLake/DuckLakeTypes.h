@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Core/Field.h>
 #include <Core/NamesAndTypes.h>
 #include <Core/Types.h>
 #include <DataTypes/IDataType.h>
@@ -55,6 +56,11 @@ std::vector<ColumnNode> buildColumnTree(const std::vector<ColumnInfo> & rows, In
 /// Build the ClickHouse type of one column node, recursing for struct/list/map and honoring
 /// nulls_allowed at every level.
 DataTypePtr getColumnType(const ColumnNode & node);
+
+/// Parse a DuckLake-serialized stats/partition value (plain numbers, ISO dates/timestamps,
+/// raw strings, DuckDB booleans) into a Field of `type`. Returns nullopt when the value
+/// cannot be parsed unambiguously for the type (caller must not rely on it).
+std::optional<Field> parseStatsValue(const String & value, const DataTypePtr & type);
 
 /// Top-level table schema from the visible column forest.
 NamesAndTypesList getTableSchema(const std::vector<ColumnNode> & roots);
