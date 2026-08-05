@@ -223,4 +223,3 @@ catch schema drift.
 - Concurrency: `ducklake_table_stats ... FOR UPDATE` serializes writers to the same
   table; cross-table snapshot-id collisions hit the primary key and retry (up to 10
   attempts).
-
