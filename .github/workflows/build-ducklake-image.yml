@@ -1,0 +1,104 @@
+name: Build DuckLake ClickHouse image
+
+# Reproducible builder for the clickhouse-ducklake server image (antalya +
+# DuckLake port). Manual-only: ClickHouse source builds are heavy, so this
+# runs on demand rather than per-push. Produces ghcr.io/posthog/clickhouse-ducklake
+# tagged with the source commit SHA.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch/tag/SHA to build
+        required: true
+        default: port/ducklake-read-antalya-26.4
+      tag:
+        description: Extra image tag (e.g. 26.4.2-ducklake.2)
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    # Depot runners: enough CPU/disk for a ClickHouse source build.
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          repository: PostHog/clickhouse
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo 'deb https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main' | sudo tee /etc/apt/sources.list.d/llvm21.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-21 lld-21 nasm yasm cmake ninja-build ccache
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+          . "$HOME/.cargo/env"
+          rustup toolchain install nightly-2026-03-22 --profile minimal
+          rustup default nightly-2026-03-22
+
+      - name: Configure
+        run: |
+          . "$HOME/.cargo/env"
+          CC=clang-21 CXX=clang++-21 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_TESTS=OFF -DENABLE_CCACHE=ON
+
+      - name: Build clickhouse
+        run: |
+          . "$HOME/.cargo/env"
+          ninja -C build clickhouse
+
+      - name: Package image
+        run: |
+          mkdir -p image
+          strip --strip-debug build/programs/clickhouse -o image/clickhouse
+          cp docker/server/entrypoint.sh docker/server/docker_related_config.xml image/
+          cp programs/server/config.xml programs/server/users.xml image/
+          cat > image/Dockerfile <<'DOCKERFILE'
+          FROM ubuntu:22.04
+          ARG DEBIAN_FRONTEND=noninteractive
+          RUN groupadd -r clickhouse --gid=101 \
+              && useradd -r -g clickhouse --uid=101 --home-dir=/var/lib/clickhouse --shell=/bin/bash clickhouse \
+              && apt-get update \
+              && apt-get install --yes --no-install-recommends busybox ca-certificates locales tzdata \
+              && busybox --install -s \
+              && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
+          COPY clickhouse /usr/bin/clickhouse
+          RUN chmod +x /usr/bin/clickhouse \
+              && for app in server client local benchmark keeper keeper-client extract-from-config compressor format obfuscator; do \
+                  ln -s /usr/bin/clickhouse /usr/bin/clickhouse-$app; done \
+              && mkdir -p /var/lib/clickhouse /var/log/clickhouse-server \
+                  /etc/clickhouse-server/config.d /etc/clickhouse-server/users.d /docker-entrypoint-initdb.d \
+              && chown -R clickhouse:clickhouse /var/lib/clickhouse /var/log/clickhouse-server /etc/clickhouse-server
+          COPY config.xml users.xml /etc/clickhouse-server/
+          COPY docker_related_config.xml /etc/clickhouse-server/config.d/
+          COPY entrypoint.sh /entrypoint.sh
+          RUN chmod +x /entrypoint.sh && chown -R clickhouse:clickhouse /etc/clickhouse-server
+          ENV CLICKHOUSE_CONFIG=/etc/clickhouse-server/config.xml
+          USER 101
+          ENTRYPOINT ["/entrypoint.sh"]
+          DOCKERFILE
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: image
+          push: true
+          tags: |
+            ghcr.io/posthog/clickhouse-ducklake:sha-${{ github.sha }}
+            ${{ inputs.tag != '' && format('ghcr.io/posthog/clickhouse-ducklake:{0}', inputs.tag) || '' }}
