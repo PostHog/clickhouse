@@ -49,7 +49,7 @@ SETTINGS allow_experimental_export_merge_tree_part = 1
 
 Source and destination tables must be 100% compatible:
 
-1. **Identical schemas** - same columns, types, and order, matched positionally like `INSERT INTO dest SELECT * FROM src`. By default the source and destination must also have the same number of columns; a source with extra trailing columns can be allowed via `export_merge_tree_part_schema_mismatch_mode`.
+1. **Compatible schemas** - by default, columns are matched positionally like `INSERT INTO dest SELECT * FROM src`, so their number and order must match. `export_merge_tree_part_schema_mismatch_mode` can allow a source with additional columns and select whether the destination columns are matched by position or by name.
 2. **Matching partition keys** - partition expressions must be identical
 
 In case a table function is used as the destination, the schema can be omitted and it will be inferred from the source table.
@@ -121,11 +121,20 @@ In case a table function is used as the destination, the schema can be omitted a
 
 - **Type**: `MergeTreePartExportSchemaMismatchMode`
 - **Default**: `strict`
-- **Description**: Controls whether `EXPORT PART`/`EXPORT PARTITION` allows a column-count mismatch between the source `MergeTree` table and the destination table. Columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Possible values:
-  - `strict` - the source and destination must have the same number of columns. A mismatch in either direction throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+- **Description**: Controls whether `EXPORT PART`/`EXPORT PARTITION` allows the source `MergeTree` table to have more columns than the destination table and how destination columns are matched in that case. Possible values:
+  - `strict` - columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`, and the source and destination must have the same number of columns. A mismatch in either direction throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
   - `ignore_extra_source_columns_by_position` - the source may have more columns than the destination. The extra trailing source columns (by position) are dropped and not exported. The destination having more columns than the source is still rejected in this mode.
+  - `ignore_extra_source_columns_by_name` - the source may have more columns than the destination. Every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be reordered and additional source columns may occur in any position. Unmatched source columns are not exported. If a destination column is absent from the source, including when it was renamed, the export throws `THERE_IS_NO_COLUMN`; there is no positional fallback. Use `ignore_extra_source_columns_by_position` when renamed columns should be matched by position.
 
-  The extra trailing source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part.
+  Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part. Type conversion and `export_merge_tree_part_allow_lossy_cast` are applied after columns are matched.
+
+  Error behavior:
+
+  - In `strict` mode, a different number of source and destination columns throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+  - In `ignore_extra_source_columns_by_position` mode, the destination having more columns than the source throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+  - In `ignore_extra_source_columns_by_name` mode, a destination column which is absent from the source throws `THERE_IS_NO_COLUMN`.
+  - Renaming a destination column in `ignore_extra_source_columns_by_name` mode throws `THERE_IS_NO_COLUMN`; the mode does not fall back to positional matching.
+  - After columns have been matched successfully, a cast rejected by the export type-safety check throws `INCOMPATIBLE_COLUMNS`.
 
 
 ## Examples
