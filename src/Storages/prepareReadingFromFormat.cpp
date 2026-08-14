@@ -1,5 +1,4 @@
 #include <Storages/prepareReadingFromFormat.h>
-#include <iostream>
 #include <Common/quoteString.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <Formats/FormatFactory.h>
