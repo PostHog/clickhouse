@@ -125,8 +125,8 @@ public:
     DB::DatabaseDataLakeCatalogType getCatalogType() const override;
 
     bool empty() const override;
-    DataLake::CatalogTables getTables() const override;
-    Namespaces getNamespaces() const override;
+    DB::Names getTables() const override;
+    Namespaces getNamespaces() const;
     bool existsTable(const std::string & namespace_name, const std::string & table_name) const override;
     void getTableMetadata(const std::string & namespace_name, const std::string & table_name, DataLake::TableMetadata & result) const override;
     bool tryGetTableMetadata(const std::string & namespace_name, const std::string & table_name, DataLake::TableMetadata & result) const override;
@@ -169,7 +169,7 @@ public:
     String getTableDataPath(const String & namespace_name, const String & table_name, Int64 snapshot_id) const;
 
 protected:
-    DataLake::CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name) const override;
+    DB::Names listTablesInNamespaceDirect(const std::string & namespace_name) const;
 
 private:
     std::unique_ptr<IDuckLakeConnection> connection;

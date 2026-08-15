@@ -402,7 +402,7 @@ DuckLakeCatalog::Namespaces DuckLakeCatalog::getNamespaces() const
     return namespaces;
 }
 
-DataLake::CatalogTables DuckLakeCatalog::listTablesInNamespaceDirect(const std::string & namespace_name) const
+DB::Names DuckLakeCatalog::listTablesInNamespaceDirect(const std::string & namespace_name) const
 {
     const Int64 snapshot = pinSnapshot();
     const auto result = connection->exec(fmt::format(
@@ -416,16 +416,16 @@ DataLake::CatalogTables DuckLakeCatalog::listTablesInNamespaceDirect(const std::
         visibilityPredicate(snapshot, "s"),
         visibilityPredicate(snapshot, "t")));
 
-    DataLake::CatalogTables tables;
+    DB::Names tables;
     tables.reserve(result.rows.size());
     for (const auto & row : result.rows)
-        tables.push_back(DataLake::CatalogTable{.name = namespace_name + "." + row[0].value_or(""), .is_readable = true});
+        tables.push_back(namespace_name + "." + row[0].value_or(""));
     return tables;
 }
 
-DataLake::CatalogTables DuckLakeCatalog::getTables() const
+DB::Names DuckLakeCatalog::getTables() const
 {
-    DataLake::CatalogTables result;
+    DB::Names result;
     for (const auto & namespace_name : getNamespaces())
     {
         auto tables = listTablesInNamespaceDirect(namespace_name);

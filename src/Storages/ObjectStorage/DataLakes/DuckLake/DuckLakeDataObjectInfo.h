@@ -32,7 +32,7 @@ struct DuckLakeDataObjectInfo : public ObjectInfo
     {
     }
 
-    std::optional<size_t> getFileSizeHint() const override
+    std::optional<size_t> getFileSizeHint() const
     {
         if (file_size_bytes.has_value())
             return static_cast<size_t>(*file_size_bytes);

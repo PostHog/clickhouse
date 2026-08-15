@@ -35,7 +35,7 @@ SharedHeader DuckLakePartitionConstantsTransform::makeOutputHeader(
     Block output_header = *input_header_;
     for (const auto & constant : constants_)
     {
-        ColumnConstPtr column = constant.type->createColumnConst(1, constant.value);
+        ColumnPtr column = constant.type->createColumnConst(1, constant.value);
         if (output_header.has(constant.name))
         {
             auto & existing = output_header.getByName(constant.name);
@@ -56,7 +56,7 @@ void DuckLakePartitionConstantsTransform::transform(Chunk & chunk)
     auto columns = chunk.detachColumns();
     for (const auto & constant : constants)
     {
-        ColumnConstPtr materialized = constant.type->createColumnConst(num_rows, constant.value);
+        ColumnPtr materialized = constant.type->createColumnConst(num_rows, constant.value);
         if (constant.input_position != std::numeric_limits<size_t>::max())
             columns[constant.input_position] = std::move(materialized);
         else

@@ -484,7 +484,7 @@ FilePruner::FilePruner(
     std::vector<std::pair<Int64, DataTypePtr>> used_columns;
     auto transformed_dag = transformFilterDag(*filter_dag, field_id_map, column_types, used_columns);
 
-    ActionsDAGWithInversionPushDown inverted_dag(transformed_dag->getOutputs().front(), context, /* boolean_context */ true);
+    ActionsDAGWithInversionPushDown inverted_dag(transformed_dag->getOutputs().front(), context);
     for (const auto & [column_id, type] : used_columns)
     {
         NameAndTypePair key_column(statsColumnName(column_id), type);
@@ -548,7 +548,7 @@ const FilePruner::PartitionKeyCondition * FilePruner::getIdentityCondition(const
         return nullptr;
 
     auto expression = std::make_shared<ExpressionActions>(std::move(key_dag), ExpressionActionsSettings(context));
-    ActionsDAGWithInversionPushDown inverted_dag(filter_dag->getOutputs().front(), context, /* boolean_context */ true);
+    ActionsDAGWithInversionPushDown inverted_dag(filter_dag->getOutputs().front(), context);
     cached_partition_condition.emplace(PartitionKeyCondition{
         .key_data_types = key_data_types,
         .condition = KeyCondition(inverted_dag, context, key_column_names, expression, /* single_point */ true),
@@ -572,7 +572,7 @@ const CalendarConstraints & FilePruner::getCalendarConstraints(const String & co
         {
             const NameAndTypePair key_column(column_name, removeNullable(column_type));
             auto expression = std::make_shared<ExpressionActions>(ActionsDAG({key_column}), ExpressionActionsSettings(context));
-            ActionsDAGWithInversionPushDown inverted_dag(filter_dag->getOutputs().front(), context, /* boolean_context */ true);
+            ActionsDAGWithInversionPushDown inverted_dag(filter_dag->getOutputs().front(), context);
             KeyCondition source_condition(inverted_dag, context, {column_name}, expression);
             Ranges ranges;
             if (source_condition.extractPlainRanges(ranges))
