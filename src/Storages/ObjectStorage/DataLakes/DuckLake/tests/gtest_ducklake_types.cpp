@@ -4,6 +4,7 @@
 
 #include <DataTypes/DataTypeDate32.h>
 #include <DataTypes/DataTypeDateTime64.h>
+#include <DataTypes/DataTypeDynamic.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -62,6 +63,8 @@ TEST(DuckLakeTypes, ScalarTypes)
     EXPECT_TRUE(typeid_cast<const DataTypeString *>(parseScalarType("json").get()));
     EXPECT_TRUE(typeid_cast<const DataTypeString *>(parseScalarType("blob").get()));
     EXPECT_TRUE(typeid_cast<const DataTypeUUID *>(parseScalarType("uuid").get()));
+    /// DuckLake `variant` maps to Dynamic; the Parquet reader decodes VARIANT groups into it.
+    EXPECT_TRUE(typeid_cast<const DataTypeDynamic *>(parseScalarType("variant").get()));
     EXPECT_TRUE(typeid_cast<const DataTypeDate32 *>(parseScalarType("date").get()));
     EXPECT_TRUE(typeid_cast<const DataTypeTime *>(parseScalarType("time").get()));
 
@@ -128,7 +131,7 @@ TEST(DuckLakeTypes, Decimal)
 
 TEST(DuckLakeTypes, UnsupportedTypesThrow)
 {
-    for (const auto * type : {"timetz", "interval", "variant", "geometry", "unknown"})
+    for (const auto * type : {"timetz", "interval", "geometry", "unknown"})
         EXPECT_THROW(parseScalarType(type), Exception) << type;
     EXPECT_THROW(parseScalarType("bogus"), Exception);
 }

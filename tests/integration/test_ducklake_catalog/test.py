@@ -15,6 +15,9 @@ from helpers.cluster import ClickHouseCluster, get_docker_compose_path, run_and_
 # generated the same way with DATA_INLINING_ROW_LIMIT 10 and cover data inlining
 # (inserts, deletes, updates, schema evolution, nested types) and partitioning;
 # ducklake_data2/ holds the data files for both.
+#
+# catalog_variant.db + ducklake_data_variant/ (sqlite only) were generated the same way and
+# cover DuckLake `variant` columns (stored as Parquet VARIANT groups by DuckDB).
 
 cluster = ClickHouseCluster(__file__)
 node = cluster.add_instance("node", stay_alive=True)
@@ -106,7 +109,7 @@ def copy_dir_to_container(instance, src_dir, dest_dir):
 def started_cluster():
     cluster.start()
     try:
-        for data_dir in ("ducklake_data", "ducklake_data2", "ducklake_data3"):
+        for data_dir in ("ducklake_data", "ducklake_data2", "ducklake_data3", "ducklake_data_variant"):
             copy_dir_to_container(
                 node,
                 os.path.join(FIXTURES_DIR, data_dir),
@@ -116,7 +119,7 @@ def started_cluster():
         tar_path = os.path.join(cluster.instances_dir, node.name, "catalogs.tar.gz")
         os.makedirs(os.path.dirname(tar_path), exist_ok=True)
         with tarfile.open(tar_path, "w:gz") as tar:
-            for db_file in ("catalog.db", "catalog2.db", "catalog3.db", "catalog_inlined.db", "catalog_badversion.db"):
+            for db_file in ("catalog.db", "catalog2.db", "catalog3.db", "catalog_inlined.db", "catalog_badversion.db", "catalog_variant.db"):
                 tar.add(os.path.join(FIXTURES_DIR, db_file), arcname=db_file)
         node.copy_file_to_container(tar_path, "/tmp/catalogs.tar.gz")
         node.exec_in_container(
@@ -412,6 +415,68 @@ def test_requires_experimental_setting(started_cluster):
             " SETTINGS catalog_type = 'ducklake', ducklake_backend = 'sqlite',"
             " ducklake_connection_string = 'catalog.db';"
         )
+
+
+def test_requires_connection_string(started_cluster):
+    node.query("DROP DATABASE IF EXISTS ducklake_no_conn SYNC")
+    with pytest.raises(QueryRuntimeException, match="ducklake_connection_string"):
+        node.query(
+            "CREATE DATABASE ducklake_no_conn ENGINE = DataLakeCatalog('ducklake')"
+            " SETTINGS catalog_type = 'ducklake', ducklake_backend = 'sqlite';",
+            settings={"allow_experimental_database_ducklake_catalog": 1},
+        )
+
+
+def test_inlined_data(started_cluster):
+    node.query("DROP DATABASE IF EXISTS ducklake_inlined SYNC")
+    node.query(
+        "CREATE DATABASE ducklake_inlined ENGINE = DataLakeCatalog('ducklake')"
+        " SETTINGS catalog_type = 'ducklake', ducklake_backend = 'sqlite',"
+        " ducklake_connection_string = 'catalog_inlined.db';",
+        settings={"allow_experimental_database_ducklake_catalog": 1},
+    )
+    # the whole table lives in the catalog (no data files at all)
+    assert node.query("SELECT * FROM `main.inl`", database="ducklake_inlined") == "1\ta\n"
+    assert node.query("SELECT * FROM `main.inl` WHERE id = 2", database="ducklake_inlined") == ""
+
+
+def test_unsupported_catalog_version(started_cluster):
+    node.query("DROP DATABASE IF EXISTS ducklake_badversion SYNC")
+    with pytest.raises(QueryRuntimeException, match="schema version"):
+        node.query(
+            "CREATE DATABASE ducklake_badversion ENGINE = DataLakeCatalog('ducklake')"
+            " SETTINGS catalog_type = 'ducklake', ducklake_backend = 'sqlite',"
+            " ducklake_connection_string = 'catalog_badversion.db';",
+            settings={"allow_experimental_database_ducklake_catalog": 1},
+        )
+
+def test_variant(started_cluster):
+    node.query("DROP DATABASE IF EXISTS ducklake_variant SYNC")
+    node.query(
+        "CREATE DATABASE ducklake_variant ENGINE = DataLakeCatalog('ducklake')"
+        " SETTINGS catalog_type = 'ducklake', ducklake_backend = 'sqlite',"
+        " ducklake_connection_string = 'catalog_variant.db';",
+        settings={"allow_experimental_database_ducklake_catalog": 1},
+    )
+    assert node.query("SHOW TABLES", database="ducklake_variant") == "main.with_variant\n"
+    # the DuckLake `variant` column maps to Dynamic; values are decoded from the
+    # Parquet VARIANT encoding (DuckDB stores whole variants as JSON text in typed_value)
+    assert node.query("SELECT * FROM `main.with_variant` ORDER BY id", database="ducklake_variant") == (
+        "1\t('login',1.5,['a','b'],(30,'alice'))\n"
+        "2\t42\n"
+        "3\t\\N\n"
+        "4\tplain string\n"
+        "5\t[1,2.5,'three',NULL,true]\n"
+        "6\t(([1,2],NULL),NULL)\n"
+    )
+    assert node.query("SELECT id, dynamicType(payload) FROM `main.with_variant` ORDER BY id", database="ducklake_variant") == (
+        "1\tTuple(event_type String, score Float64, tags Array(String), user Tuple(age Int64, name String))\n"
+        "2\tInt64\n"
+        "3\tNone\n"
+        "4\tString\n"
+        "5\tArray(Dynamic)\n"
+        "6\tTuple(nested Tuple(x Array(Int64), y Nullable(String)), nothing Nullable(String))\n"
+    )
 
 
 def test_requires_connection_string(started_cluster):
