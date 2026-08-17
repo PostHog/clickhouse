@@ -670,41 +670,6 @@ bool SchemaConverter::processSubtreeArrayInner(TraversalNode & node)
 }
 
 
-/// Whether the subtree rooted at `schema[root_idx]` (a group) contains only REQUIRED, non-repeated
-/// elements below the root. If so, none of its descendants add a definition level, so every leaf's
-/// definition-level null map is exactly the root group's null map. This lets us reconstruct the
-/// group null map from any leaf and read a physically nullable struct (OPTIONAL group) as
-/// Nullable(Tuple(...)) losslessly. Returns false for any OPTIONAL/REPEATED descendant.
-static bool tupleSubtreeIsAllRequired(const std::vector<parq::SchemaElement> & schema, size_t root_idx)
-{
-    /// schema is a flattened pre-order tree; num_children counts direct children, laid out
-    /// contiguously in pre-order. Walk the root's subtree with an explicit stack of
-    /// remaining-children counters for the groups we descended into.
-    if (root_idx >= schema.size())
-        return false;
-    std::vector<size_t> stack;
-    stack.push_back(size_t(schema.at(root_idx).num_children));
-    size_t idx = root_idx + 1;
-    while (!stack.empty())
-    {
-        if (stack.back() == 0)
-        {
-            stack.pop_back();
-            continue;
-        }
-        if (idx >= schema.size())
-            return false; // malformed schema; caller handles elsewhere
-        stack.back() -= 1;
-        const parq::SchemaElement & elem = schema.at(idx);
-        if (elem.repetition_type != parq::FieldRepetitionType::REQUIRED)
-            return false;
-        idx += 1;
-        if (elem.__isset.num_children && elem.num_children > 0)
-            stack.push_back(size_t(elem.num_children));
-    }
-    return true;
-}
-
 /// Number of schema elements in the subtree rooted at schema[idx] (including schema[idx]).
 static size_t schemaSubtreeSize(const std::vector<parq::SchemaElement> & schema, size_t idx)
 {

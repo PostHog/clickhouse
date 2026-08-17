@@ -105,7 +105,7 @@ void checkDepth(size_t depth, const FormatSettings & settings)
         throw Exception(ErrorCodes::TOO_DEEP_RECURSION, "Variant value is nested deeper than the limit ({})", settings.max_parser_depth);
 }
 
-void writeFloatJSON(Float64 x, WriteBuffer & out, const FormatSettings & settings)
+void writeFloatJSON(Float64 x, WriteBuffer & out, const FormatSettings &  /*settings*/)
 {
     /// JSON has no representation for inf/nan.
     if (!isFinite(x))
@@ -113,7 +113,7 @@ void writeFloatJSON(Float64 x, WriteBuffer & out, const FormatSettings & setting
         out.write("null", 4);
         return;
     }
-    writeFloatText(x, out, settings);
+    writeFloatText(x, out);
 }
 
 void variantPrimitiveToJSON(uint8_t primitive_type, std::string_view data, WriteBuffer & out, const FormatSettings & settings)

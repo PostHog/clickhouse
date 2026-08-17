@@ -14,7 +14,6 @@
 #include <Formats/FormatFilterInfo.h>
 #include <Interpreters/castColumn.h>
 #include <IO/CompressionMethod.h>
-#include <IO/Libdeflate.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
 #include <Processors/Formats/Impl/Parquet/Decoding.h>
