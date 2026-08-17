@@ -144,6 +144,14 @@ DatabaseDataLake::DatabaseDataLake(
     , db_uuid(uuid)
 {
     validateSettings();
+
+    /// Build the DuckLake catalog eagerly so misconfiguration (unsupported catalog schema
+    /// version, unreachable catalog, missing ducklake_* tables) is reported at CREATE time
+    /// instead of surfacing lazily on first table access. (Upstream master does this for all
+    /// catalog types via a lazy_init ctor flag that 26.4 does not have; DuckLake catalog
+    /// construction is a single small metadata query, so eager attach cost is negligible.)
+    if (settings[DatabaseDataLakeSetting::catalog_type].value == DB::DatabaseDataLakeCatalogType::DUCKLAKE)
+        getCatalog();
 }
 
 void DatabaseDataLake::validateSettings()
