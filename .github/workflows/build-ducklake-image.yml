@@ -27,7 +27,7 @@ jobs:
     timeout-minutes: 300
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: PostHog/clickhouse
           ref: ${{ inputs.ref }}
