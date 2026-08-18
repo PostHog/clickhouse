@@ -410,9 +410,10 @@ String visibilityPredicate(Int64 snapshot_id, const String & alias)
         "({0} >= {1}.begin_snapshot AND ({0} < {1}.end_snapshot OR {1}.end_snapshot IS NULL))", snapshot_id, alias);
 }
 
-/// DuckLake does not vend storage credentials. For local tables no credentials are needed at
-/// all, so satisfy the requiresCredentials() request with a no-op. For remote storages the
-/// generic static-credentials machinery applies instead.
+/// DuckLake does not vend storage credentials. Satisfy the requiresCredentials() request with
+/// a no-op credential set: local (file://) tables need no credentials at all, and remote
+/// object storage (s3://) falls through to the environment credential chain — the pod's IRSA
+/// identity in the managed-warehouse deployment — since the engine args carry no keys.
 class NoCredentials final : public DataLake::IStorageCredentials
 {
 public:
@@ -1399,7 +1400,9 @@ bool DuckLakeCatalog::tryGetTableMetadata(
         .ducklake_schema_name = namespace_name,
         .ducklake_table_name = table_name,
     });
-    if (result.requiresCredentials() && location.starts_with("file://"))
+    /// DuckLake never vends credentials: local tables need none, and object-storage tables
+    /// authenticate via the environment credential chain (IRSA in the mw deployment).
+    if (result.requiresCredentials())
         result.setStorageCredentials(std::make_shared<NoCredentials>());
     return true;
 }
