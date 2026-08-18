@@ -1120,11 +1120,24 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
     if (listing.files.empty())
         return listing;
 
+    /// ducklake_file_column_stats / ducklake_file_partition_value have no index on table_id
+    /// (DuckDB owns the schema), so `WHERE table_id = ...` seq-scans every row ever written.
+    /// Restrict to the snapshot-visible files: postgres hash-joins the id list instead.
+    String visible_file_ids = "'{";
+    for (size_t i = 0; i < listing.files.size(); ++i)
+    {
+        if (i > 0)
+            visible_file_ids += ',';
+        visible_file_ids += std::to_string(listing.files[i].data_file_id);
+    }
+    visible_file_ids += "}'::bigint[]";
+
     const auto stats = connection->exec(fmt::format(
         "SELECT data_file_id, column_id, value_count, null_count, contains_nan, min_value, max_value "
-        "FROM {} WHERE table_id = {}",
+        "FROM {} WHERE table_id = {} AND data_file_id = ANY({})",
         connection->qualified("ducklake_file_column_stats"),
-        table_id));
+        table_id,
+        visible_file_ids));
     for (const auto & row : stats.rows)
     {
         const Int64 data_file_id = parseInt64(row[0], "data_file_id");
@@ -1144,9 +1157,10 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
     }
 
     const auto partition_values = connection->exec(fmt::format(
-        "SELECT data_file_id, partition_key_index, partition_value FROM {} WHERE table_id = {}",
+        "SELECT data_file_id, partition_key_index, partition_value FROM {} WHERE table_id = {} AND data_file_id = ANY({})",
         connection->qualified("ducklake_file_partition_value"),
-        table_id));
+        table_id,
+        visible_file_ids));
     for (const auto & row : partition_values.rows)
     {
         const Int64 data_file_id = parseInt64(row[0], "data_file_id");
@@ -1286,9 +1300,11 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
     /// Unlike everything else the rows are physically removed by a flush, so they are only
     /// consistent with the pinned snapshot when nothing commits concurrently; the snapshot
     /// re-check at the end of this method catches that race loudly.
+    bool inlined_deletes_engaged = false;
     const String inlined_deletes_table = fmt::format("ducklake_inlined_delete_{}", table_id);
     if (connection->tableExists(inlined_deletes_table))
     {
+        inlined_deletes_engaged = true;
         std::unordered_map<Int64, size_t> position_by_file_id;
         for (size_t i = 0; i < listing.files.size(); ++i)
             position_by_file_id.emplace(listing.files[i].data_file_id, i);
@@ -1317,11 +1333,13 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
         }
     }
 
-    /// The catalog is read with several independent statements; a concurrent commit (e.g. an
-    /// inlining flush physically removing ducklake_inlined_delete rows) could leave the file
-    /// list and the inlined deletions inconsistent. Detect it and fail loudly rather than
-    /// silently resurrecting deleted rows.
-    if (pinSnapshot() != snapshot_id)
+    /// ducklake_inlined_delete rows are physically removed by a flush, so they are the only
+    /// read here that can go stale under a concurrent commit (everything else is
+    /// visibility-filtered). Only pay the changed-snapshot re-check when that path ran — on a
+    /// busy catalog a commit lands mid-listing constantly, and throwing then just makes
+    /// queries flap. Detect the real race and fail loudly rather than silently resurrecting
+    /// deleted rows.
+    if (inlined_deletes_engaged && pinSnapshot() != snapshot_id)
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
             "DuckLake catalog changed while reading table (id {}) metadata; retry the query",
