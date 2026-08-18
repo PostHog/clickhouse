@@ -1123,18 +1123,18 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
     /// ducklake_file_column_stats / ducklake_file_partition_value have no index on table_id
     /// (DuckDB owns the schema), so `WHERE table_id = ...` seq-scans every row ever written.
     /// Restrict to the snapshot-visible files: postgres hash-joins the id list instead.
-    String visible_file_ids = "'{";
+    String visible_file_ids = "(";
     for (size_t i = 0; i < listing.files.size(); ++i)
     {
         if (i > 0)
             visible_file_ids += ',';
         visible_file_ids += std::to_string(listing.files[i].data_file_id);
     }
-    visible_file_ids += "}'::bigint[]";
+    visible_file_ids += ")";
 
     const auto stats = connection->exec(fmt::format(
         "SELECT data_file_id, column_id, value_count, null_count, contains_nan, min_value, max_value "
-        "FROM {} WHERE table_id = {} AND data_file_id = ANY({})",
+        "FROM {} WHERE table_id = {} AND data_file_id IN {}",
         connection->qualified("ducklake_file_column_stats"),
         table_id,
         visible_file_ids));
@@ -1157,7 +1157,7 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
     }
 
     const auto partition_values = connection->exec(fmt::format(
-        "SELECT data_file_id, partition_key_index, partition_value FROM {} WHERE table_id = {} AND data_file_id = ANY({})",
+        "SELECT data_file_id, partition_key_index, partition_value FROM {} WHERE table_id = {} AND data_file_id IN {}",
         connection->qualified("ducklake_file_partition_value"),
         table_id,
         visible_file_ids));
