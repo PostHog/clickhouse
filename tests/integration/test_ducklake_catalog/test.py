@@ -688,3 +688,77 @@ def test_ducklake_write_concurrent(started_cluster):
         node.query("SELECT * FROM `main.plain` WHERE id >= 5000 ORDER BY id", database=db)
         == "5000\tcc5000\n5001\tcc5001\n"
     )
+
+
+def test_ducklake_read_during_concurrent_commits(started_cluster):
+    """A query must observe one consistent catalog snapshot even while another writer
+    commits (compaction/flush advancing ducklake_snapshot). The catalog read now runs
+    inside one REPEATABLE READ transaction (DuckLakeCatalog.beginSnapshotRead); before
+    that, a commit landing between the listing's autocommit statements aborted the query
+    with "DuckLake catalog changed while reading table metadata" whenever the table had
+    an inlined delete table, and a flush physically removing inlined rows mid-read could
+    resurrect deleted rows / lose flushed ones.
+
+    The inlined delete table below is fabricated to match DuckDB's
+    ducklake_inlined_delete_<table_id> shape; the old failure mode only engaged when it
+    existed. This test is a stress check (it cannot deterministically place a commit
+    between two reader statements), so it asserts the property that must hold for ANY
+    interleaving: reads never fail with the changed-catalog error.
+    """
+    import threading
+
+    create_postgres_db()
+    db = "ducklake_pg"
+
+    postgres_container_id = cluster.get_instance_docker_id("postgres1")
+    table_id = int(
+        run_and_check(
+            [
+                f"docker exec {postgres_container_id} psql -U postgres -d postgres -t -A -c "
+                f"\"SELECT table_id FROM ducklake_table WHERE table_name = 'plain' AND end_snapshot IS NULL\""
+            ],
+            shell=True,
+        ).strip()
+    )
+    run_and_check(
+        [
+            f"docker exec {postgres_container_id} psql -U postgres -d postgres -c "
+            f"'CREATE TABLE IF NOT EXISTS ducklake_inlined_delete_{table_id} "
+            f"(file_id BIGINT, row_id BIGINT, begin_snapshot BIGINT)'"
+        ],
+        shell=True,
+    )
+
+    base = int(node.query("SELECT count() FROM `main.plain`", database=db))
+
+    errors = []
+
+    def reader():
+        for _ in range(30):
+            try:
+                count = int(node.query("SELECT count() FROM `main.plain`", database=db))
+                # rows are only ever added; a torn snapshot would resurrect or drop rows
+                assert base <= count <= base + 40, f"implausible count {count}"
+            except Exception as e:
+                errors.append(e)
+
+    def writer():
+        for i in range(40):
+            node.query(
+                f"INSERT INTO `main.plain` VALUES ({10000 + i}, 'w{i}')",
+                database=db,
+                settings=WRITE_SETTINGS,
+            )
+
+    threads = [threading.Thread(target=reader) for _ in range(3)]
+    threads.append(threading.Thread(target=writer))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors, f"read failures during concurrent commits: {errors[:3]}"
+    assert (
+        node.query("SELECT count() FROM `main.plain`", database=db)
+        == f"{base + 40}\n"
+    )

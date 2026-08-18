@@ -32,6 +32,7 @@ extern const int SQLITE_ENGINE_ERROR;
 extern const int POSTGRESQL_CONNECTION_FAILURE;
 extern const int DUCKLAKE_CATALOG_ERROR;
 extern const int UNSUPPORTED_METHOD;
+extern const int LOGICAL_ERROR;
 }
 
 namespace
@@ -121,9 +122,66 @@ public:
     /// Begin a catalog write transaction. The SQLite backend throws UNSUPPORTED_METHOD:
     /// writes are supported for PostgreSQL catalogs only.
     virtual std::unique_ptr<IDuckLakeTransaction> beginTransaction() = 0;
+
+    /// Begin a snapshot read transaction and return a connection view whose exec() calls
+    /// all run inside it (REPEATABLE READ READ ONLY on postgres). The transaction ends
+    /// when the view is destroyed. Needed because visibility-filtered reads cannot see
+    /// rows a concurrent flush physically removed (inlined deletes/data): only a real
+    /// transaction keeps a multi-statement catalog read on one snapshot.
+    virtual std::unique_ptr<IDuckLakeConnection> beginReadTx() = 0;
 };
 
 #if USE_SQLITE
+
+/// Run one statement and collect all rows. The query is a single statement; prepare/step
+/// it directly (sqlite3_exec would stringify BLOB values and truncate them at the first
+/// zero byte).
+static DuckLakeQueryResult sqliteExec(sqlite3 * db, const String & query)
+{
+    sqlite3_stmt * stmt = nullptr;
+    DuckLakeQueryResult result;
+    int status = sqlite3_prepare_v2(db, query.c_str(), static_cast<int>(query.size() + 1), &stmt, nullptr);
+    if (status != SQLITE_OK)
+        throw Exception(
+            ErrorCodes::SQLITE_ENGINE_ERROR,
+            "DuckLake catalog query failed to prepare. Error status: {}. Query: {}",
+            status,
+            query);
+
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> stmt_holder(stmt, &sqlite3_finalize);
+
+    const int col_num = sqlite3_column_count(stmt);
+    while ((status = sqlite3_step(stmt)) == SQLITE_ROW)
+    {
+        if (result.column_names.empty())
+        {
+            result.column_names.reserve(col_num);
+            for (int i = 0; i < col_num; ++i)
+                result.column_names.emplace_back(sqlite3_column_name(stmt, i));
+        }
+        DuckLakeQueryResult::Row row;
+        row.reserve(col_num);
+        for (int i = 0; i < col_num; ++i)
+        {
+            if (sqlite3_column_type(stmt, i) == SQLITE_NULL)
+            {
+                row.emplace_back(std::nullopt);
+                continue;
+            }
+            const char * data = reinterpret_cast<const char *>(sqlite3_column_text(stmt, i));
+            const int bytes = sqlite3_column_bytes(stmt, i);
+            row.emplace_back(String(data, bytes));
+        }
+        result.rows.push_back(std::move(row));
+    }
+    if (status != SQLITE_DONE)
+        throw Exception(
+            ErrorCodes::SQLITE_ENGINE_ERROR,
+            "DuckLake catalog query failed. Error status: {}. Query: {}",
+            status,
+            query);
+    return result;
+}
 
 class DuckLakeSQLiteConnection final : public IDuckLakeConnection
 {
@@ -140,52 +198,7 @@ public:
     {
         std::lock_guard lock(mutex);
         ensureOpen();
-
-        sqlite3_stmt * stmt = nullptr;
-        DuckLakeQueryResult result;
-        /// The query is a single statement; prepare/step it directly (sqlite3_exec would
-        /// stringify BLOB values and truncate them at the first zero byte).
-        int status = sqlite3_prepare_v2(db.get(), query.c_str(), static_cast<int>(query.size() + 1), &stmt, nullptr);
-        if (status != SQLITE_OK)
-            throw Exception(
-                ErrorCodes::SQLITE_ENGINE_ERROR,
-                "DuckLake catalog query failed to prepare. Error status: {}. Query: {}",
-                status,
-                query);
-
-        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> stmt_holder(stmt, &sqlite3_finalize);
-
-        const int col_num = sqlite3_column_count(stmt);
-        while ((status = sqlite3_step(stmt)) == SQLITE_ROW)
-        {
-            if (result.column_names.empty())
-            {
-                result.column_names.reserve(col_num);
-                for (int i = 0; i < col_num; ++i)
-                    result.column_names.emplace_back(sqlite3_column_name(stmt, i));
-            }
-            DuckLakeQueryResult::Row row;
-            row.reserve(col_num);
-            for (int i = 0; i < col_num; ++i)
-            {
-                if (sqlite3_column_type(stmt, i) == SQLITE_NULL)
-                {
-                    row.emplace_back(std::nullopt);
-                    continue;
-                }
-                const char * data = reinterpret_cast<const char *>(sqlite3_column_text(stmt, i));
-                const int bytes = sqlite3_column_bytes(stmt, i);
-                row.emplace_back(String(data, bytes));
-            }
-            result.rows.push_back(std::move(row));
-        }
-        if (status != SQLITE_DONE)
-            throw Exception(
-                ErrorCodes::SQLITE_ENGINE_ERROR,
-                "DuckLake catalog query failed. Error status: {}. Query: {}",
-                status,
-                query);
-        return result;
+        return sqliteExec(db.get(), query);
     }
 
     bool tableExists(const String & name) override
@@ -203,6 +216,8 @@ public:
             database_path);
     }
 
+    std::unique_ptr<IDuckLakeConnection> beginReadTx() override;
+
 private:
     String database_path;
     ContextPtr context;
@@ -216,9 +231,89 @@ private:
     }
 };
 
+/// Snapshot-read view over its own sqlite connection with a deferred transaction open, so
+/// all statements of one logical catalog read observe one snapshot. A second connection is
+/// used instead of the shared one so a long-lived snapshot read never serializes against
+/// unrelated autocommit catalog lookups (and vice versa).
+class DuckLakeSQLiteReadTx final : public IDuckLakeConnection
+{
+public:
+    DuckLakeSQLiteReadTx(const String & database_path, ContextPtr context)
+        : db(openSQLiteDB(database_path, context, /* throw_on_error */ true))
+    {
+        sqliteExec(db.get(), "BEGIN");
+    }
+
+    ~DuckLakeSQLiteReadTx() override
+    {
+        try
+        {
+            sqliteExec(db.get(), "ROLLBACK");
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger("DuckLakeSQLiteReadTx"), "Failed to roll back catalog snapshot read");
+        }
+    }
+
+    DuckLakeQueryResult exec(const String & query) override
+    {
+        return sqliteExec(db.get(), query);
+    }
+
+    bool tableExists(const String & name) override
+    {
+        return !exec(fmt::format("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = {} LIMIT 1", quoteLiteral(name))).rows.empty();
+    }
+
+    String qualified(const String & table) override { return quoteIdentifier(table); }
+
+    std::unique_ptr<IDuckLakeTransaction> beginTransaction() override
+    {
+        throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Writes are not supported on a DuckLake snapshot read transaction");
+    }
+
+    std::unique_ptr<IDuckLakeConnection> beginReadTx() override
+    {
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot nest DuckLake snapshot read transactions");
+    }
+
+private:
+    SQLitePtr db;
+};
+
+std::unique_ptr<IDuckLakeConnection> DuckLakeSQLiteConnection::beginReadTx()
+{
+    return std::make_unique<DuckLakeSQLiteReadTx>(database_path, context);
+}
+
 #endif
 
 #if USE_LIBPQXX
+
+static DuckLakeQueryResult pqxxMapResult(const pqxx::result & res)
+{
+    DuckLakeQueryResult result;
+    result.column_names.reserve(res.columns());
+    for (pqxx::row::size_type i = 0; i < res.columns(); ++i)
+        result.column_names.emplace_back(res.column_name(i));
+
+    result.rows.reserve(res.size());
+    for (const auto & prow : res)
+    {
+        DuckLakeQueryResult::Row row;
+        row.reserve(prow.size());
+        for (const auto & field : prow)
+        {
+            if (field.is_null())
+                row.emplace_back(std::nullopt);
+            else
+                row.emplace_back(String(field.c_str()));
+        }
+        result.rows.push_back(std::move(row));
+    }
+    return result;
+}
 
 class DuckLakePostgresConnection final : public IDuckLakeConnection
 {
@@ -236,28 +331,7 @@ public:
         {
             ensureOpen();
             pqxx::nontransaction tx(*connection);
-            pqxx::result res = tx.exec(query);
-
-            DuckLakeQueryResult result;
-            result.column_names.reserve(res.columns());
-            for (pqxx::row::size_type i = 0; i < res.columns(); ++i)
-                result.column_names.emplace_back(res.column_name(i));
-
-            result.rows.reserve(res.size());
-            for (const auto & prow : res)
-            {
-                DuckLakeQueryResult::Row row;
-                row.reserve(prow.size());
-                for (const auto & field : prow)
-                {
-                    if (field.is_null())
-                        row.emplace_back(std::nullopt);
-                    else
-                        row.emplace_back(String(field.c_str()));
-                }
-                result.rows.push_back(std::move(row));
-            }
-            return result;
+            return pqxxMapResult(tx.exec(query));
         }
         catch (const pqxx::broken_connection & e)
         {
@@ -281,6 +355,8 @@ public:
 
     std::unique_ptr<IDuckLakeTransaction> beginTransaction() override;
 
+    std::unique_ptr<IDuckLakeConnection> beginReadTx() override;
+
 private:
     friend class DuckLakePostgresTransaction;
 
@@ -295,6 +371,83 @@ private:
             connection = std::make_unique<pqxx::connection>(conninfo);
     }
 };
+
+/// Snapshot-read view over a dedicated connection running one REPEATABLE READ READ ONLY
+/// transaction for its whole lifetime. A dedicated connection (rather than the shared
+/// autocommit one) is what lets a query hold its snapshot from pinning through its last
+/// catalog read without serializing against other queries' catalog access. Postgres
+/// guarantees the snapshot stays fixed for the transaction, so rows physically removed by
+/// a concurrent flush (inlined deletes/data) remain visible for their pinned snapshot.
+class DuckLakePostgresReadTx final : public IDuckLakeConnection
+{
+public:
+    using Transaction = pqxx::transaction<pqxx::isolation_level::repeatable_read, pqxx::write_policy::read_only>;
+
+    DuckLakePostgresReadTx(const String & conninfo_, const String & catalog_schema_)
+        : connection(std::make_unique<pqxx::connection>(conninfo_))
+        , tx(std::make_unique<Transaction>(*connection))
+        , catalog_schema(catalog_schema_)
+    {
+    }
+
+    ~DuckLakePostgresReadTx() override
+    {
+        try
+        {
+            if (tx)
+                tx->abort();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger("DuckLakePostgresReadTx"), "Failed to abort catalog snapshot read");
+        }
+    }
+
+    DuckLakeQueryResult exec(const String & query) override
+    try
+    {
+        return pqxxMapResult(tx->exec(query));
+    }
+    catch (const pqxx::broken_connection & e)
+    {
+        tx.reset();
+        connection.reset();
+        throw Exception(ErrorCodes::POSTGRESQL_CONNECTION_FAILURE, "DuckLake catalog connection broken: {}", e.what());
+    }
+
+    bool tableExists(const String & name) override
+    {
+        const auto result = exec(fmt::format(
+            "SELECT to_regclass({}) IS NOT NULL",
+            quoteLiteral(fmt::format("{}.{}", catalog_schema, name))));
+        return !result.rows.empty() && parseBool(result.rows[0][0]);
+    }
+
+    String qualified(const String & table) override
+    {
+        return fmt::format("{}.{}", quoteIdentifier(catalog_schema), quoteIdentifier(table));
+    }
+
+    std::unique_ptr<IDuckLakeTransaction> beginTransaction() override
+    {
+        throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Writes are not supported on a DuckLake snapshot read transaction");
+    }
+
+    std::unique_ptr<IDuckLakeConnection> beginReadTx() override
+    {
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot nest DuckLake snapshot read transactions");
+    }
+
+private:
+    std::unique_ptr<pqxx::connection> connection;
+    std::unique_ptr<Transaction> tx;
+    String catalog_schema;
+};
+
+std::unique_ptr<IDuckLakeConnection> DuckLakePostgresConnection::beginReadTx()
+{
+    return std::make_unique<DuckLakePostgresReadTx>(conninfo, catalog_schema);
+}
 
 /// Catalog write transaction over pqxx::work. Holds the connection's mutex for its whole
 /// lifetime: a commit is a short, fixed sequence of statements, so readers only ever wait
@@ -580,8 +733,8 @@ Int64 DuckLakeCatalog::appendDataFiles(
     }
 
     /// column_id -> type of every visible column, for type-aware stats comparisons below.
-    const auto column_rows = getColumnRows(table_id);
-    const auto column_tree = DuckLake::buildColumnTree(column_rows, pinSnapshot());
+    const auto column_rows = getColumnRows(*connection, table_id);
+    const auto column_tree = DuckLake::buildColumnTree(column_rows, pinSnapshot(*connection));
     std::unordered_map<Int64, NameAndTypePair> column_types;
     std::function<void(const DuckLake::ColumnNode &)> collect_types = [&](const DuckLake::ColumnNode & node)
     {
@@ -853,12 +1006,20 @@ bool DuckLakeCatalog::isPostgres() const
     return sqlite_database_path.empty();
 }
 
-Int64 DuckLakeCatalog::pinSnapshot() const
+Int64 DuckLakeCatalog::pinSnapshot(IDuckLakeConnection & conn) const
 {
-    const auto result = connection->exec(fmt::format("SELECT COALESCE(MAX(snapshot_id), 0) FROM {}", connection->qualified("ducklake_snapshot")));
+    const auto result = conn.exec(fmt::format("SELECT COALESCE(MAX(snapshot_id), 0) FROM {}", conn.qualified("ducklake_snapshot")));
     if (result.rows.empty())
         return 0;
     return parseInt64(result.rows[0][0], "snapshot_id");
+}
+
+std::shared_ptr<DuckLakeCatalog::SnapshotRead> DuckLakeCatalog::beginSnapshotRead() const
+{
+    auto read = std::make_shared<SnapshotRead>();
+    read->conn = connection->beginReadTx();
+    read->snapshot_id = pinSnapshot(*read->conn);
+    return read;
 }
 
 bool DuckLakeCatalog::empty() const
@@ -868,7 +1029,7 @@ bool DuckLakeCatalog::empty() const
 
 DuckLakeCatalog::Namespaces DuckLakeCatalog::getNamespaces() const
 {
-    const Int64 snapshot = pinSnapshot();
+    const Int64 snapshot = pinSnapshot(*connection);
     const auto result = connection->exec(fmt::format(
         "SELECT schema_name FROM {} WHERE {} ORDER BY schema_name",
         connection->qualified("ducklake_schema"),
@@ -883,7 +1044,7 @@ DuckLakeCatalog::Namespaces DuckLakeCatalog::getNamespaces() const
 
 DB::Names DuckLakeCatalog::listTablesInNamespaceDirect(const std::string & namespace_name) const
 {
-    const Int64 snapshot = pinSnapshot();
+    const Int64 snapshot = pinSnapshot(*connection);
     const auto result = connection->exec(fmt::format(
         "SELECT t.table_name FROM {0} t "
         "JOIN {1} s ON s.schema_id = t.schema_id "
@@ -913,14 +1074,14 @@ DB::Names DuckLakeCatalog::getTables() const
     return result;
 }
 
-std::optional<std::pair<Int64, Int64>> DuckLakeCatalog::findTable(const String & namespace_name, const String & table_name, Int64 snapshot_id) const
+std::optional<std::pair<Int64, Int64>> DuckLakeCatalog::findTable(IDuckLakeConnection & conn, const String & namespace_name, const String & table_name, Int64 snapshot_id) const
 {
-    const auto result = connection->exec(fmt::format(
+    const auto result = conn.exec(fmt::format(
         "SELECT t.table_id, s.schema_id FROM {0} t "
         "JOIN {1} s ON s.schema_id = t.schema_id "
         "WHERE s.schema_name = {2} AND t.table_name = {3} AND {4} AND {5}",
-        connection->qualified("ducklake_table"),
-        connection->qualified("ducklake_schema"),
+        conn.qualified("ducklake_table"),
+        conn.qualified("ducklake_schema"),
         quoteLiteral(namespace_name),
         quoteLiteral(table_name),
         visibilityPredicate(snapshot_id, "s"),
@@ -933,7 +1094,7 @@ std::optional<std::pair<Int64, Int64>> DuckLakeCatalog::findTable(const String &
 
 bool DuckLakeCatalog::existsTable(const std::string & namespace_name, const std::string & table_name) const
 {
-    return findTable(namespace_name, table_name, pinSnapshot()).has_value();
+    return findTable(*connection, namespace_name, table_name, pinSnapshot(*connection)).has_value();
 }
 
 namespace
@@ -948,14 +1109,14 @@ String joinPaths(const String & base, const String & suffix)
 
 }
 
-String DuckLakeCatalog::getTableDataPath(const String & namespace_name, const String & table_name, Int64 snapshot_id) const
+String DuckLakeCatalog::getTableDataPath(IDuckLakeConnection & conn, const String & namespace_name, const String & table_name, Int64 snapshot_id) const
 {
-    const auto result = connection->exec(fmt::format(
+    const auto result = conn.exec(fmt::format(
         "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative FROM {0} t "
         "JOIN {1} s ON s.schema_id = t.schema_id "
         "WHERE s.schema_name = {2} AND t.table_name = {3} AND {4} AND {5}",
-        connection->qualified("ducklake_table"),
-        connection->qualified("ducklake_schema"),
+        conn.qualified("ducklake_table"),
+        conn.qualified("ducklake_schema"),
         quoteLiteral(namespace_name),
         quoteLiteral(table_name),
         visibilityPredicate(snapshot_id, "s"),
@@ -978,12 +1139,12 @@ String DuckLakeCatalog::getTableDataPath(const String & namespace_name, const St
     return location;
 }
 
-std::vector<DuckLake::ColumnInfo> DuckLakeCatalog::getColumnRows(Int64 table_id) const
+std::vector<DuckLake::ColumnInfo> DuckLakeCatalog::getColumnRows(IDuckLakeConnection & conn, Int64 table_id) const
 {
-    const auto result = connection->exec(fmt::format(
+    const auto result = conn.exec(fmt::format(
         "SELECT column_id, parent_column, column_order, column_name, column_type, nulls_allowed, "
         "begin_snapshot, end_snapshot FROM {} WHERE table_id = {} ORDER BY column_id",
-        connection->qualified("ducklake_column"),
+        conn.qualified("ducklake_column"),
         table_id));
 
     std::vector<DuckLake::ColumnInfo> columns;
@@ -1006,15 +1167,15 @@ std::vector<DuckLake::ColumnInfo> DuckLakeCatalog::getColumnRows(Int64 table_id)
     return columns;
 }
 
-DuckLakeTableSnapshotInfo DuckLakeCatalog::getTableSnapshotInfo(const String & namespace_name, const String & table_name) const
+DuckLakeTableSnapshotInfo DuckLakeCatalog::getTableSnapshotInfo(IDuckLakeConnection & conn, const String & namespace_name, const String & table_name, Int64 snapshot_id) const
 {
-    const Int64 snapshot = pinSnapshot();
-    const auto table = findTable(namespace_name, table_name, snapshot);
+    const Int64 snapshot = snapshot_id;
+    const auto table = findTable(conn, namespace_name, table_name, snapshot);
     if (!table.has_value())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "DuckLake table {}.{} does not exist", namespace_name, table_name);
     const auto [table_id, schema_id] = *table;
 
-    const auto column_rows = getColumnRows(table_id);
+    const auto column_rows = getColumnRows(conn, table_id);
     auto roots = DuckLake::buildColumnTree(column_rows, snapshot);
 
     std::unordered_map<Int64, NameAndTypePair> column_types;
@@ -1036,11 +1197,11 @@ DuckLakeTableSnapshotInfo DuckLakeCatalog::getTableSnapshotInfo(const String & n
     };
 }
 
-DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot_id) const
+DuckLakeFileListing DuckLakeCatalog::getDataFiles(IDuckLakeConnection & conn, Int64 table_id, Int64 snapshot_id) const
 {
     DuckLakeFileListing listing;
 
-    const auto data_files = connection->exec(fmt::format(
+    const auto data_files = conn.exec(fmt::format(
         "SELECT data.data_file_id, data.path, data.path_is_relative, data.record_count, data.file_size_bytes, "
         "data.encryption_key, data.mapping_id, data.file_format, data.partition_id, "
         "del.path, del.path_is_relative, del.format, del.delete_count, del.encryption_key "
@@ -1048,8 +1209,8 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
         "LEFT JOIN {1} del ON del.data_file_id = data.data_file_id AND {2} "
         "WHERE data.table_id = {3} AND {4} "
         "ORDER BY data.data_file_id",
-        connection->qualified("ducklake_data_file"),
-        connection->qualified("ducklake_delete_file"),
+        conn.qualified("ducklake_data_file"),
+        conn.qualified("ducklake_delete_file"),
         visibilityPredicate(snapshot_id, "del"),
         table_id,
         visibilityPredicate(snapshot_id, "data")));
@@ -1132,10 +1293,10 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
     }
     visible_file_ids += ")";
 
-    const auto stats = connection->exec(fmt::format(
+    const auto stats = conn.exec(fmt::format(
         "SELECT data_file_id, column_id, value_count, null_count, contains_nan, min_value, max_value "
         "FROM {} WHERE table_id = {} AND data_file_id IN {}",
-        connection->qualified("ducklake_file_column_stats"),
+        conn.qualified("ducklake_file_column_stats"),
         table_id,
         visible_file_ids));
     for (const auto & row : stats.rows)
@@ -1156,9 +1317,9 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
         });
     }
 
-    const auto partition_values = connection->exec(fmt::format(
+    const auto partition_values = conn.exec(fmt::format(
         "SELECT data_file_id, partition_key_index, partition_value FROM {} WHERE table_id = {} AND data_file_id IN {}",
-        connection->qualified("ducklake_file_partition_value"),
+        conn.qualified("ducklake_file_partition_value"),
         table_id,
         visible_file_ids));
     for (const auto & row : partition_values.rows)
@@ -1175,14 +1336,14 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
         it->partition_values[partition_key_index] = row[2];
     }
 
-    const auto partition_specs = connection->exec(fmt::format(
+    const auto partition_specs = conn.exec(fmt::format(
         "SELECT pc.partition_id, pc.partition_key_index, pc.column_id, pc.transform "
         "FROM {0} pc "
         "JOIN {1} pi ON pi.partition_id = pc.partition_id AND {2} "
         "WHERE pc.table_id = {3} "
         "ORDER BY pc.partition_id, pc.partition_key_index",
-        connection->qualified("ducklake_partition_column"),
-        connection->qualified("ducklake_partition_info"),
+        conn.qualified("ducklake_partition_column"),
+        conn.qualified("ducklake_partition_info"),
         visibilityPredicate(snapshot_id, "pi"),
         table_id));
     for (const auto & row : partition_specs.rows)
@@ -1207,9 +1368,9 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
         }
         if (!position_by_mapping_id.empty())
         {
-            const auto column_mappings = connection->exec(fmt::format(
+            const auto column_mappings = conn.exec(fmt::format(
                 "SELECT mapping_id, type FROM {} WHERE table_id = {}",
-                connection->qualified("ducklake_column_mapping"),
+                conn.qualified("ducklake_column_mapping"),
                 table_id));
             for (const auto & row : column_mappings.rows)
             {
@@ -1221,14 +1382,14 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
                         mapping_type);
             }
 
-            const auto name_mappings = connection->exec(fmt::format(
+            const auto name_mappings = conn.exec(fmt::format(
                 "SELECT nm.mapping_id, nm.column_id, nm.source_name, nm.target_field_id, "
                 "nm.parent_column, nm.is_partition "
                 "FROM {0} nm "
                 "JOIN {1} cm ON cm.mapping_id = nm.mapping_id "
                 "WHERE cm.table_id = {2}",
-                connection->qualified("ducklake_name_mapping"),
-                connection->qualified("ducklake_column_mapping"),
+                conn.qualified("ducklake_name_mapping"),
+                conn.qualified("ducklake_column_mapping"),
                 table_id));
 
             struct RawNameMapRow
@@ -1300,18 +1461,16 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
     /// Unlike everything else the rows are physically removed by a flush, so they are only
     /// consistent with the pinned snapshot when nothing commits concurrently; the snapshot
     /// re-check at the end of this method catches that race loudly.
-    bool inlined_deletes_engaged = false;
     const String inlined_deletes_table = fmt::format("ducklake_inlined_delete_{}", table_id);
-    if (connection->tableExists(inlined_deletes_table))
+    if (conn.tableExists(inlined_deletes_table))
     {
-        inlined_deletes_engaged = true;
         std::unordered_map<Int64, size_t> position_by_file_id;
         for (size_t i = 0; i < listing.files.size(); ++i)
             position_by_file_id.emplace(listing.files[i].data_file_id, i);
 
-        const auto inlined_deletes = connection->exec(fmt::format(
+        const auto inlined_deletes = conn.exec(fmt::format(
             "SELECT file_id, row_id FROM {} WHERE begin_snapshot <= {}",
-            connection->qualified(inlined_deletes_table),
+            conn.qualified(inlined_deletes_table),
             snapshot_id));
         for (const auto & row : inlined_deletes.rows)
         {
@@ -1335,31 +1494,22 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(Int64 table_id, Int64 snapshot
 
     /// ducklake_inlined_delete rows are physically removed by a flush, so they are the only
     /// read here that can go stale under a concurrent commit (everything else is
-    /// visibility-filtered). Only pay the changed-snapshot re-check when that path ran — on a
-    /// busy catalog a commit lands mid-listing constantly, and throwing then just makes
-    /// queries flap. Detect the real race and fail loudly rather than silently resurrecting
-    /// deleted rows.
-    if (inlined_deletes_engaged && pinSnapshot() != snapshot_id)
-        throw Exception(
-            ErrorCodes::BAD_ARGUMENTS,
-            "DuckLake catalog changed while reading table (id {}) metadata; retry the query",
-            table_id);
 
     return listing;
 }
 
-std::vector<DuckLakeInlinedDataTable> DuckLakeCatalog::getInlinedDataTables(Int64 table_id) const
+std::vector<DuckLakeInlinedDataTable> DuckLakeCatalog::getInlinedDataTables(IDuckLakeConnection & conn, Int64 table_id) const
 {
-    const auto result = connection->exec(fmt::format(
+    const auto result = conn.exec(fmt::format(
         "SELECT table_name, schema_version FROM {} WHERE table_id = {}",
-        connection->qualified("ducklake_inlined_data_tables"),
+        conn.qualified("ducklake_inlined_data_tables"),
         table_id));
 
     std::vector<DuckLakeInlinedDataTable> tables;
     for (const auto & row : result.rows)
     {
         const String table_name = row[0].value_or("");
-        if (table_name.empty() || !connection->tableExists(table_name))
+        if (table_name.empty() || !conn.tableExists(table_name))
             continue;
         tables.push_back(DuckLakeInlinedDataTable{
             .table_name = table_name,
@@ -1370,20 +1520,20 @@ std::vector<DuckLakeInlinedDataTable> DuckLakeCatalog::getInlinedDataTables(Int6
 }
 
 std::pair<std::vector<String>, std::vector<std::vector<std::optional<String>>>>
-DuckLakeCatalog::getInlinedRows(const String & inlined_table, Int64 snapshot_id) const
+DuckLakeCatalog::getInlinedRows(IDuckLakeConnection & conn, const String & inlined_table, Int64 snapshot_id) const
 {
-    auto result = connection->exec(fmt::format(
+    auto result = conn.exec(fmt::format(
         "SELECT * FROM {} inlined WHERE {} ORDER BY row_id",
-        connection->qualified(inlined_table),
+        conn.qualified(inlined_table),
         visibilityPredicate(snapshot_id, "inlined")));
     return {std::move(result.column_names), std::move(result.rows)};
 }
 
-std::map<Int64, Int64> DuckLakeCatalog::getSchemaVersionFirstSnapshots() const
+std::map<Int64, Int64> DuckLakeCatalog::getSchemaVersionFirstSnapshots(IDuckLakeConnection & conn) const
 {
-    const auto result = connection->exec(fmt::format(
+    const auto result = conn.exec(fmt::format(
         "SELECT schema_version, MIN(snapshot_id) FROM {} GROUP BY schema_version",
-        connection->qualified("ducklake_snapshot")));
+        conn.qualified("ducklake_snapshot")));
 
     std::map<Int64, Int64> versions;
     for (const auto & row : result.rows)
@@ -1405,12 +1555,15 @@ bool DuckLakeCatalog::tryGetTableMetadata(
     const std::string & table_name,
     DataLake::TableMetadata & result) const
 {
-    const Int64 snapshot = pinSnapshot();
-    if (!findTable(namespace_name, table_name, snapshot).has_value())
+    /// One session for the whole lookup: pin + find + schema + path all observe the same
+    /// catalog snapshot (previously this pinned three separate times).
+    const auto read = beginSnapshotRead();
+    const Int64 snapshot = read->snapshot_id;
+    if (!findTable(*read->conn, namespace_name, table_name, snapshot).has_value())
         return false;
 
-    const auto info = getTableSnapshotInfo(namespace_name, table_name);
-    const String location = getTableDataPath(namespace_name, table_name, snapshot);
+    const auto info = getTableSnapshotInfo(*read->conn, namespace_name, table_name, snapshot);
+    const String location = getTableDataPath(*read->conn, namespace_name, table_name, snapshot);
     result.setLocation(location);
     result.setSchema(info.schema);
     result.setDataLakeSpecificProperties(DataLake::DataLakeSpecificProperties{

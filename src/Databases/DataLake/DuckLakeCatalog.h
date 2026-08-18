@@ -198,36 +198,53 @@ public:
         const std::optional<Int64> & partition_id,
         const std::vector<DuckLakeNewDataFile> & files);
 
-    /// Pin MAX(snapshot_id) and load schema + field-id map for one table.
-    /// Throws if the table does not exist.
-    DuckLakeTableSnapshotInfo getTableSnapshotInfo(const String & namespace_name, const String & table_name) const;
+    /// One pinned catalog snapshot read through its own transaction. `conn` is a
+    /// transaction-scoped view of the catalog (REPEATABLE READ READ ONLY on postgres):
+    /// every statement through it observes exactly `snapshot_id`, including rows a
+    /// concurrent flush physically removed (inlined deletes/data). Visibility-filtered
+    /// reads alone cannot see those — a flush between two autocommit statements both
+    /// resurrects deleted rows and loses flushed ones — so a query holds one SnapshotRead
+    /// from pinning through its last catalog read. Destroying it ends the transaction.
+    struct SnapshotRead
+    {
+        std::unique_ptr<IDuckLakeConnection> conn;
+        Int64 snapshot_id;
+    };
+
+    /// Open a snapshot transaction and pin MAX(snapshot_id) inside it, so the pin and all
+    /// subsequent reads through the session are one consistent catalog view.
+    std::shared_ptr<SnapshotRead> beginSnapshotRead() const;
+
+    /// Load schema + field-id map for one table at `snapshot_id`.
+    /// Throws if the table does not exist at that snapshot.
+    DuckLakeTableSnapshotInfo getTableSnapshotInfo(IDuckLakeConnection & conn, const String & namespace_name, const String & table_name, Int64 snapshot_id) const;
 
     /// List data files (with delete files, column stats, partition values and inlined
     /// deletions) visible at `snapshot_id`, plus the partition specs they reference.
     /// Throws on unsupported per-file features (encryption, name mapping, puffin).
-    DuckLakeFileListing getDataFiles(Int64 table_id, Int64 snapshot_id) const;
+    DuckLakeFileListing getDataFiles(IDuckLakeConnection & conn, Int64 table_id, Int64 snapshot_id) const;
 
     /// Inlined data tables registered for `table_id` (ducklake_inlined_data_tables).
     /// Tables that do not exist in the catalog are skipped (already dropped by a flush).
-    std::vector<DuckLakeInlinedDataTable> getInlinedDataTables(Int64 table_id) const;
+    std::vector<DuckLakeInlinedDataTable> getInlinedDataTables(IDuckLakeConnection & conn, Int64 table_id) const;
 
     /// SQL column names and row values of `inlined_table` visible at `snapshot_id`
     /// (begin/end snapshot visibility), ordered by row_id.
     /// Returns empty column_names when the table does not exist.
     std::pair<std::vector<String>, std::vector<std::vector<std::optional<String>>>>
-    getInlinedRows(const String & inlined_table, Int64 snapshot_id) const;
+    getInlinedRows(IDuckLakeConnection & conn, const String & inlined_table, Int64 snapshot_id) const;
 
     /// Global schema_version -> first snapshot_id that has it (ducklake_snapshot is global).
     /// Inlined data tables are named with the global schema version at their creation, so
     /// this maps an inlined table's schema_version to the snapshot whose visible column
     /// names match the inlined table's SQL columns.
-    std::map<Int64, Int64> getSchemaVersionFirstSnapshots() const;
+    std::map<Int64, Int64> getSchemaVersionFirstSnapshots(IDuckLakeConnection & conn) const;
 
     /// All ducklake_column rows (full history) of `table_id`, sorted by column_id.
-    std::vector<DuckLake::ColumnInfo> getColumnRows(Int64 table_id) const;
+    std::vector<DuckLake::ColumnInfo> getColumnRows(IDuckLakeConnection & conn, Int64 table_id) const;
 
     /// Absolute table data path (with URI scheme) as resolved from data_path + schema/table paths.
-    String getTableDataPath(const String & namespace_name, const String & table_name, Int64 snapshot_id) const;
+    String getTableDataPath(IDuckLakeConnection & conn, const String & namespace_name, const String & table_name, Int64 snapshot_id) const;
 
 protected:
     DB::Names listTablesInNamespaceDirect(const std::string & namespace_name) const;
@@ -239,8 +256,8 @@ private:
     /// Raw sqlite database file path (sqlite backend only), used to resolve a relative data_path.
     String sqlite_database_path;
 
-    Int64 pinSnapshot() const;
-    std::optional<std::pair<Int64, Int64>> findTable(const String & namespace_name, const String & table_name, Int64 snapshot_id) const;
+    Int64 pinSnapshot(IDuckLakeConnection & conn) const;
+    std::optional<std::pair<Int64, Int64>> findTable(IDuckLakeConnection & conn, const String & namespace_name, const String & table_name, Int64 snapshot_id) const;
 };
 
 }

@@ -223,6 +223,7 @@ DuckLakeMetadata::DuckLakeMetadata(
     ObjectStoragePtr object_storage_,
     StorageObjectStorageConfigurationWeakPtr configuration_,
     std::shared_ptr<DuckLakeCatalog> catalog_,
+    std::shared_ptr<DuckLakeCatalog::SnapshotRead> snapshot_read_,
     Int64 snapshot_id_,
     Int64 table_id_,
     NamesAndTypesList schema_,
@@ -233,6 +234,7 @@ DuckLakeMetadata::DuckLakeMetadata(
     : object_storage(std::move(object_storage_))
     , configuration(std::move(configuration_))
     , catalog(std::move(catalog_))
+    , snapshot_read(std::move(snapshot_read_))
     , snapshot_id(snapshot_id_)
     , table_id(table_id_)
     , schema(std::move(schema_))
@@ -272,12 +274,16 @@ DataLakeMetadataPtr DuckLakeMetadata::create(
     if (!catalog)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Database '{}' does not have a DuckLake catalog", database_name);
 
-    auto info = catalog->getTableSnapshotInfo(schema_name, table_name);
+    /// Hold one catalog snapshot transaction for the whole query: the pin, the schema
+    /// read, and the later file listing + inlined reads all observe the same snapshot,
+    /// even if a flush physically removes inlined rows mid-query.
+    auto snapshot_read = catalog->beginSnapshotRead();
+    auto info = catalog->getTableSnapshotInfo(*snapshot_read->conn, schema_name, table_name, snapshot_read->snapshot_id);
 
     auto column_mapper = std::make_shared<ColumnMapper>();
     column_mapper->setStorageColumnEncoding(std::move(info.field_id_map));
 
-    String catalog_path = stripScheme(catalog->getTableDataPath(schema_name, table_name, info.snapshot_id));
+    String catalog_path = stripScheme(catalog->getTableDataPath(*snapshot_read->conn, schema_name, table_name, info.snapshot_id));
     while (catalog_path.ends_with('/'))
         catalog_path.pop_back();
 
@@ -289,6 +295,7 @@ DataLakeMetadataPtr DuckLakeMetadata::create(
         object_storage,
         configuration,
         std::move(catalog),
+        std::move(snapshot_read),
         info.snapshot_id,
         info.table_id,
         std::move(info.schema),
@@ -361,7 +368,7 @@ ObjectIterator DuckLakeMetadata::iterate(
     StorageMetadataPtr /* storage_metadata_snapshot */,
     ContextPtr context) const
 {
-    auto listing = catalog->getDataFiles(table_id, snapshot_id);
+    auto listing = catalog->getDataFiles(*snapshot_read->conn, table_id, snapshot_id);
 
     static const std::unordered_map<String, Int64> no_field_ids;
     const auto & field_id_map = column_mapper ? column_mapper->getStorageColumnEncoding() : no_field_ids;
@@ -519,7 +526,7 @@ Pipe DuckLakeMetadata::getAdditionalReadPipe(
     ContextPtr /*context*/,
     size_t /*max_block_size*/) const
 {
-    const auto inlined_tables = catalog->getInlinedDataTables(table_id);
+    const auto inlined_tables = catalog->getInlinedDataTables(*snapshot_read->conn, table_id);
     if (inlined_tables.empty())
         return {};
 
@@ -532,7 +539,7 @@ Pipe DuckLakeMetadata::getAdditionalReadPipe(
     std::vector<InlinedTableData> tables_with_rows;
     for (const auto & inlined_table : inlined_tables)
     {
-        auto [column_names, rows] = catalog->getInlinedRows(inlined_table.table_name, snapshot_id);
+        auto [column_names, rows] = catalog->getInlinedRows(*snapshot_read->conn, inlined_table.table_name, snapshot_id);
         if (!rows.empty())
             tables_with_rows.push_back(InlinedTableData{inlined_table.schema_version, std::move(column_names), std::move(rows)});
     }
@@ -578,8 +585,8 @@ Pipe DuckLakeMetadata::getAdditionalReadPipe(
     }
 
     const auto & field_id_map = column_mapper->getStorageColumnEncoding();
-    const auto schema_version_snapshots = catalog->getSchemaVersionFirstSnapshots();
-    const auto column_history = catalog->getColumnRows(table_id);
+    const auto schema_version_snapshots = catalog->getSchemaVersionFirstSnapshots(*snapshot_read->conn);
+    const auto column_history = catalog->getColumnRows(*snapshot_read->conn, table_id);
     const bool postgres_backend = catalog->isPostgres();
 
     const std::vector<NameAndTypePair> header_columns_vec(header_columns.begin(), header_columns.end());

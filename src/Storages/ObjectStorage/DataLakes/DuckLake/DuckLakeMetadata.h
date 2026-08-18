@@ -8,14 +8,13 @@
 #include <Core/Types.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Interpreters/Context_fwd.h>
+#include <Databases/DataLake/DuckLakeCatalog.h>
 #include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeDataObjectInfo.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 #include <Common/logger_useful.h>
 
 namespace DB
 {
-
-class DuckLakeCatalog;
 
 /// DuckLake table metadata pinned to one catalog snapshot_id.
 /// Immutable per query (supportsUpdate() == false): every query re-creates it and re-pins.
@@ -29,6 +28,7 @@ public:
         ObjectStoragePtr object_storage_,
         StorageObjectStorageConfigurationWeakPtr configuration_,
         std::shared_ptr<DuckLakeCatalog> catalog_,
+        std::shared_ptr<DuckLakeCatalog::SnapshotRead> snapshot_read_,
         Int64 snapshot_id_,
         Int64 table_id_,
         NamesAndTypesList schema_,
@@ -102,6 +102,9 @@ private:
     ObjectStoragePtr object_storage;
     StorageObjectStorageConfigurationWeakPtr configuration;
     std::shared_ptr<DuckLakeCatalog> catalog;
+    /// The catalog snapshot transaction this metadata is pinned to; held for the whole
+    /// query so every catalog read (file listing, inlined rows) observes snapshot_id.
+    std::shared_ptr<DuckLakeCatalog::SnapshotRead> snapshot_read;
     Int64 snapshot_id;
     Int64 table_id;
     NamesAndTypesList schema;
