@@ -551,6 +551,15 @@ const CalendarConstraints & FilePruner::getCalendarConstraints(const String & co
     return source_range_constraints.emplace(column_name, std::move(constraints)).first->second;
 }
 
+std::vector<Int64> FilePruner::minMaxColumnIds() const
+{
+    std::vector<Int64> ids;
+    ids.reserve(min_max_conditions.size());
+    for (const auto & condition : min_max_conditions)
+        ids.push_back(condition.column_id);
+    return ids;
+}
+
 bool FilePruner::canBePruned(
     const DuckLakeDataFileEntry & file,
     const std::vector<DuckLakePartitionField> * partition_spec) const

@@ -153,6 +153,21 @@ struct DuckLakeTableSnapshotInfo
 
 /// Read-only DuckLake catalog on top of PostgreSQL or SQLite, implementing the DuckLake 1.0
 /// metadata schema (ducklake_metadata_manager.cpp in the DuckLake repository).
+/// Which side-table reads DuckLakeCatalog::getDataFiles should do. On a busy catalog
+/// these tables are the largest in the schema, so callers scope them to what they can
+/// actually use.
+struct DuckLakeListingOptions
+{
+    /// Per-column min/max stats to read: nullopt = all columns (default), empty =
+    /// skip the ducklake_file_column_stats read entirely, non-empty = only these
+    /// column ids. Fewer stats never causes wrong pruning, only less.
+    std::optional<std::vector<Int64>> stats_column_ids;
+    /// Skip the ducklake_file_partition_value read (callers that cannot
+    /// partition-prune, e.g. unfiltered scans). Missing values never cause wrong
+    /// pruning, only less.
+    bool fetch_partition_values = true;
+};
+
 class DuckLakeCatalog : public DataLake::ICatalog
 {
 public:
@@ -228,7 +243,8 @@ public:
     /// List data files (with delete files, column stats, partition values and inlined
     /// deletions) visible at `snapshot_id`, plus the partition specs they reference.
     /// Throws on unsupported per-file features (encryption, name mapping, puffin).
-    DuckLakeFileListing getDataFiles(IDuckLakeConnection & conn, Int64 table_id, Int64 snapshot_id) const;
+    DuckLakeFileListing getDataFiles(
+        IDuckLakeConnection & conn, Int64 table_id, Int64 snapshot_id, const DuckLakeListingOptions & options = {}) const;
 
     /// Inlined data tables registered for `table_id` (ducklake_inlined_data_tables).
     /// Tables that do not exist in the catalog are skipped (already dropped by a flush).

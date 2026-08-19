@@ -392,11 +392,19 @@ ObjectIterator DuckLakeMetadata::iterate(
     StorageMetadataPtr /* storage_metadata_snapshot */,
     ContextPtr context) const
 {
-    auto listing = catalog->getDataFiles(*snapshot_read->conn, table_id, snapshot_id);
-
     static const std::unordered_map<String, Int64> no_field_ids;
     const auto & field_id_map = column_mapper ? column_mapper->getStorageColumnEncoding() : no_field_ids;
     DuckLake::FilePruner pruner(filter_dag, field_id_map, column_types_by_id, context);
+
+    /// Scope the listing's side-table reads to what the pruner can use: stats only for
+    /// min/max-constrained columns (skipped entirely when the filter has none), and
+    /// partition values only when there is a filter at all. On a large catalog these
+    /// reads dominate the listing cost.
+    DuckLakeListingOptions options;
+    options.stats_column_ids = pruner.minMaxColumnIds();
+    options.fetch_partition_values = pruner.hasFilter();
+
+    auto listing = catalog->getDataFiles(*snapshot_read->conn, table_id, snapshot_id, options);
 
     /// Inverse of the field-id map: column id -> clickhouse dotted name (covers inactive
     /// columns via their synthetic names). Used to resolve name-mapping target ids.

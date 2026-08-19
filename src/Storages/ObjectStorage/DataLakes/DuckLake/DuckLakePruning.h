@@ -71,6 +71,14 @@ public:
         const DuckLakeDataFileEntry & file,
         const std::vector<DuckLakePartitionField> * partition_spec) const;
 
+    /// Column ids the pruner can min/max-prune on, in first-use order (empty when the
+    /// filter has no usable conditions — the catalog's stats read can be skipped).
+    std::vector<Int64> minMaxColumnIds() const;
+
+    /// False only when there is no filter at all; then per-file partition values can
+    /// never prune and the catalog read of them can be skipped.
+    bool hasFilter() const { return filter_dag != nullptr; }
+
 private:
     struct MinMaxCondition
     {
