@@ -1281,59 +1281,67 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(IDuckLakeConnection & conn, In
     if (listing.files.empty())
         return listing;
 
-    /// ducklake_file_column_stats / ducklake_file_partition_value have no index on table_id
-    /// (DuckDB owns the schema), so `WHERE table_id = ...` seq-scans every row ever written.
-    /// Restrict to the snapshot-visible files: postgres hash-joins the id list instead.
-    String visible_file_ids = "(";
-    for (size_t i = 0; i < listing.files.size(); ++i)
+    /// ducklake_file_column_stats / ducklake_file_partition_value historically had no index on
+    /// table_id (DuckDB owns the schema), so `WHERE table_id = ...` seq-scanned every row ever
+    /// written; restrict both reads to the snapshot-visible files. Batch the id list: a single
+    /// IN (...) over ~10^7+ ids exceeds postgres's 1GB allocation cap during parse/plan
+    /// ("invalid memory alloc request size 1073741824"), which is exactly the catalog scale
+    /// this scoping exists for. 100k ids per batch keeps each statement ~1MB.
+    static constexpr size_t ducklake_stats_id_batch = 100000;
+    for (size_t batch_begin = 0; batch_begin < listing.files.size(); batch_begin += ducklake_stats_id_batch)
     {
-        if (i > 0)
-            visible_file_ids += ',';
-        visible_file_ids += std::to_string(listing.files[i].data_file_id);
-    }
-    visible_file_ids += ")";
+        const size_t batch_end = std::min(batch_begin + ducklake_stats_id_batch, listing.files.size());
+        String batch_ids = "(";
+        for (size_t i = batch_begin; i < batch_end; ++i)
+        {
+            if (i > batch_begin)
+                batch_ids += ',';
+            batch_ids += std::to_string(listing.files[i].data_file_id);
+        }
+        batch_ids += ")";
 
-    const auto stats = conn.exec(fmt::format(
-        "SELECT data_file_id, column_id, value_count, null_count, contains_nan, min_value, max_value "
-        "FROM {} WHERE table_id = {} AND data_file_id IN {}",
-        conn.qualified("ducklake_file_column_stats"),
-        table_id,
-        visible_file_ids));
-    for (const auto & row : stats.rows)
-    {
-        const Int64 data_file_id = parseInt64(row[0], "data_file_id");
-        auto it = std::lower_bound(
-            listing.files.begin(), listing.files.end(), data_file_id,
-            [](const DuckLakeDataFileEntry & entry, Int64 id) { return entry.data_file_id < id; });
-        if (it == listing.files.end() || it->data_file_id != data_file_id)
-            continue;
-        it->column_stats.push_back(DuckLakeFileColumnStats{
-            .column_id = parseInt64(row[1], "column_id"),
-            .value_count = row[2].has_value() ? std::stoll(*row[2]) : 0,
-            .null_count = row[3].has_value() ? std::stoll(*row[3]) : 0,
-            .contains_nan = parseBool(row[4]),
-            .min_value = row[5],
-            .max_value = row[6],
-        });
-    }
+        const auto stats = conn.exec(fmt::format(
+            "SELECT data_file_id, column_id, value_count, null_count, contains_nan, min_value, max_value "
+            "FROM {} WHERE table_id = {} AND data_file_id IN {}",
+            conn.qualified("ducklake_file_column_stats"),
+            table_id,
+            batch_ids));
+        for (const auto & row : stats.rows)
+        {
+            const Int64 data_file_id = parseInt64(row[0], "data_file_id");
+            auto it = std::lower_bound(
+                listing.files.begin(), listing.files.end(), data_file_id,
+                [](const DuckLakeDataFileEntry & entry, Int64 id) { return entry.data_file_id < id; });
+            if (it == listing.files.end() || it->data_file_id != data_file_id)
+                continue;
+            it->column_stats.push_back(DuckLakeFileColumnStats{
+                .column_id = parseInt64(row[1], "column_id"),
+                .value_count = row[2].has_value() ? std::stoll(*row[2]) : 0,
+                .null_count = row[3].has_value() ? std::stoll(*row[3]) : 0,
+                .contains_nan = parseBool(row[4]),
+                .min_value = row[5],
+                .max_value = row[6],
+            });
+        }
 
-    const auto partition_values = conn.exec(fmt::format(
-        "SELECT data_file_id, partition_key_index, partition_value FROM {} WHERE table_id = {} AND data_file_id IN {}",
-        conn.qualified("ducklake_file_partition_value"),
-        table_id,
-        visible_file_ids));
-    for (const auto & row : partition_values.rows)
-    {
-        const Int64 data_file_id = parseInt64(row[0], "data_file_id");
-        const auto partition_key_index = static_cast<size_t>(parseInt64(row[1], "partition_key_index"));
-        auto it = std::lower_bound(
-            listing.files.begin(), listing.files.end(), data_file_id,
-            [](const DuckLakeDataFileEntry & entry, Int64 id) { return entry.data_file_id < id; });
-        if (it == listing.files.end() || it->data_file_id != data_file_id)
-            continue;
-        if (it->partition_values.size() <= partition_key_index)
-            it->partition_values.resize(partition_key_index + 1);
-        it->partition_values[partition_key_index] = row[2];
+        const auto partition_values = conn.exec(fmt::format(
+            "SELECT data_file_id, partition_key_index, partition_value FROM {} WHERE table_id = {} AND data_file_id IN {}",
+            conn.qualified("ducklake_file_partition_value"),
+            table_id,
+            batch_ids));
+        for (const auto & row : partition_values.rows)
+        {
+            const Int64 data_file_id = parseInt64(row[0], "data_file_id");
+            const auto partition_key_index = static_cast<size_t>(parseInt64(row[1], "partition_key_index"));
+            auto it = std::lower_bound(
+                listing.files.begin(), listing.files.end(), data_file_id,
+                [](const DuckLakeDataFileEntry & entry, Int64 id) { return entry.data_file_id < id; });
+            if (it == listing.files.end() || it->data_file_id != data_file_id)
+                continue;
+            if (it->partition_values.size() <= partition_key_index)
+                it->partition_values.resize(partition_key_index + 1);
+            it->partition_values[partition_key_index] = row[2];
+        }
     }
 
     const auto partition_specs = conn.exec(fmt::format(
