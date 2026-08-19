@@ -68,6 +68,13 @@ void DuckLakeObjectSerializableInfo::serializeForClusterFunctionProtocol(WriteBu
         writeVarInt(field_id, out);
     }
 
+    writeVarUInt(column_mapper_name_mapping.size(), out);
+    for (const auto & [parquet_path, clickhouse_name] : column_mapper_name_mapping)
+    {
+        writeStringBinary(parquet_path, out);
+        writeStringBinary(clickhouse_name, out);
+    }
+
     writeVarUInt(partition_constants.size(), out);
     for (const auto & constant : partition_constants)
     {
@@ -131,6 +138,18 @@ void DuckLakeObjectSerializableInfo::deserializeForClusterFunctionProtocol(ReadB
         readStringBinary(name, in);
         readVarInt(field_id, in);
         column_mapper_encoding.emplace_back(std::move(name), field_id);
+    }
+
+    size_t name_mapping_size = 0;
+    readVarUInt(name_mapping_size, in);
+    column_mapper_name_mapping.reserve(name_mapping_size);
+    for (size_t i = 0; i < name_mapping_size; ++i)
+    {
+        String parquet_path;
+        String clickhouse_name;
+        readStringBinary(parquet_path, in);
+        readStringBinary(clickhouse_name, in);
+        column_mapper_name_mapping.emplace_back(std::move(parquet_path), std::move(clickhouse_name));
     }
 
     size_t constants_size = 0;

@@ -20,7 +20,16 @@ from helpers.cluster import ClickHouseCluster, get_docker_compose_path, run_and_
 # cover DuckLake `variant` columns (stored as Parquet VARIANT groups by DuckDB).
 
 cluster = ClickHouseCluster(__file__)
-node = cluster.add_instance("node", stay_alive=True)
+node = cluster.add_instance(
+    "node",
+    main_configs=["configs/remote_servers.xml"],
+    stay_alive=True,
+)
+node2 = cluster.add_instance(
+    "node2",
+    main_configs=["configs/remote_servers.xml"],
+    stay_alive=True,
+)
 
 cluster.base_cmd.extend(
     ["--file", os.path.join(get_docker_compose_path(), "docker_compose_postgres.yml")]
@@ -110,11 +119,12 @@ def started_cluster():
     cluster.start()
     try:
         for data_dir in ("ducklake_data", "ducklake_data2", "ducklake_data3", "ducklake_data_variant"):
-            copy_dir_to_container(
-                node,
-                os.path.join(FIXTURES_DIR, data_dir),
-                f"/var/lib/clickhouse/user_files/{data_dir}",
-            )
+            for instance in (node, node2):
+                copy_dir_to_container(
+                    instance,
+                    os.path.join(FIXTURES_DIR, data_dir),
+                    f"/var/lib/clickhouse/user_files/{data_dir}",
+                )
         # the .db files are too large for copy_file_to_container (argv limit), tar them
         tar_path = os.path.join(cluster.instances_dir, node.name, "catalogs.tar.gz")
         os.makedirs(os.path.dirname(tar_path), exist_ok=True)
@@ -123,6 +133,10 @@ def started_cluster():
                 tar.add(os.path.join(FIXTURES_DIR, db_file), arcname=db_file)
         node.copy_file_to_container(tar_path, "/tmp/catalogs.tar.gz")
         node.exec_in_container(
+            ["bash", "-c", "tar -xzf /tmp/catalogs.tar.gz -C /var/lib/clickhouse/user_files"]
+        )
+        node2.copy_file_to_container(tar_path, "/tmp/catalogs.tar.gz")
+        node2.exec_in_container(
             ["bash", "-c", "tar -xzf /tmp/catalogs.tar.gz -C /var/lib/clickhouse/user_files"]
         )
 
@@ -821,3 +835,166 @@ def test_ducklake_snapshot_id_propagation_stamp(started_cluster):
     create_postgres_db()
     node.query("SELECT count() FROM `main.plain`", database="ducklake_pg")
     assert node.grep_in_log("DuckLake: pinned catalog snapshot")
+
+
+def create_parallel_fresh_db_on(instance):
+    """A pristine copy of the pg fixture catalog, so no data files written by the write
+    tests (which land on node1's local filesystem only) are referenced. Both nodes can
+    read every file the fresh catalog lists."""
+    postgres_container_id = cluster.get_instance_docker_id("postgres1")
+    run_and_check(
+        [f"docker exec {postgres_container_id} psql -U postgres -c 'DROP DATABASE IF EXISTS ducklake_parallel WITH (FORCE)'"],
+        shell=True,
+    )
+    run_and_check(
+        [f"docker exec {postgres_container_id} psql -U postgres -c 'CREATE DATABASE ducklake_parallel'"],
+        shell=True,
+    )
+    run_and_check(
+        [f"docker exec {postgres_container_id} psql -U postgres -d ducklake_parallel -f /tmp/catalog.sql"],
+        shell=True,
+    )
+    instance.query("DROP DATABASE IF EXISTS ducklake_par SYNC")
+    instance.query(
+        "CREATE DATABASE ducklake_par ENGINE = DataLakeCatalog('ducklake')"
+        " SETTINGS catalog_type = 'ducklake', ducklake_backend = 'postgres',"
+        " ducklake_connection_string = 'host=postgres1 port=5432 dbname=ducklake_parallel user=postgres';",
+        settings={"allow_experimental_database_ducklake_catalog": 1},
+    )
+
+
+PARALLEL_REPLICAS_SETTINGS = {
+    "allow_experimental_parallel_reading_from_replicas": 1,
+    "parallel_replicas_for_cluster_engines": 1,
+    "cluster_for_parallel_replicas": "ducklake_cluster",
+    "max_parallel_replicas": 2,
+}
+
+
+def create_postgres_db_on(instance):
+    instance.query("DROP DATABASE IF EXISTS ducklake_pg SYNC")
+    instance.query(
+        "CREATE DATABASE ducklake_pg ENGINE = DataLakeCatalog('ducklake')"
+        " SETTINGS catalog_type = 'ducklake', ducklake_backend = 'postgres',"
+        " ducklake_connection_string = 'host=postgres1 port=5432 dbname=postgres user=postgres';",
+        settings={"allow_experimental_database_ducklake_catalog": 1},
+    )
+
+
+def create_postgres3_db_on(instance):
+    instance.query("DROP DATABASE IF EXISTS ducklake_pg3 SYNC")
+    instance.query(
+        "CREATE DATABASE ducklake_pg3 ENGINE = DataLakeCatalog('ducklake')"
+        " SETTINGS catalog_type = 'ducklake', ducklake_backend = 'postgres',"
+        " ducklake_connection_string = 'host=postgres1 port=5432 dbname=ducklake3 user=postgres';",
+        settings={"allow_experimental_database_ducklake_catalog": 1},
+    )
+
+
+def test_ducklake_parallel_replicas(started_cluster):
+    """A parallel-replicas query over a DuckLake table returns exactly the single-node
+    result: the initiator pins one catalog snapshot (ducklake_snapshot_id propagates with
+    the query) and every task carries the file's full read state (positional delete files,
+    inlined deletions, per-file name mapping, partition constants) to the secondary."""
+    for instance in (node, node2):
+        create_parallel_fresh_db_on(instance)
+        create_postgres3_db_on(instance)
+
+    single_node_deletes = node.query("SELECT * FROM `main.with_deletes` ORDER BY id", database="ducklake_par")
+    single_node_mapped = node.query(
+        "SELECT id, title, region, s, l, m, extra FROM `main.mapped` ORDER BY id", database="ducklake_pg3"
+    )
+    single_node_plain = node.query("SELECT count(), sum(id) FROM `main.plain`", database="ducklake_par")
+
+    # positional deletes must hold on the secondary (delete files ride the task)
+    assert (
+        node.query(
+            "SELECT /* ducklake-pr-marker-1 */ * FROM `main.with_deletes` ORDER BY id",
+            database="ducklake_par",
+            settings=PARALLEL_REPLICAS_SETTINGS,
+        )
+        == single_node_deletes
+    )
+    assert single_node_deletes == "1\ta\n4\td\n"
+
+    # name-mapped files + catalog-side partition constants must survive the task round-trip
+    assert (
+        node.query(
+            "SELECT /* ducklake-pr-marker-2 */ id, title, region, s, l, m, extra FROM `main.mapped` ORDER BY id",
+            database="ducklake_pg3",
+            settings=PARALLEL_REPLICAS_SETTINGS,
+        )
+        == single_node_mapped
+    )
+
+    # aggregate over a table both nodes must split
+    assert (
+        node.query(
+            "SELECT count(), sum(id) FROM `main.plain`",
+            database="ducklake_par",
+            settings=PARALLEL_REPLICAS_SETTINGS,
+        )
+        == single_node_plain
+    )
+
+    # evidence the secondary actually participated: its log shows the secondary query for
+    # the mapped table (query text is rewritten on dispatch, comments stripped, so match
+    # the table name, which only this test queries on node2)
+    assert node2.grep_in_log("main.mapped")
+
+
+def test_ducklake_parallel_replicas_under_concurrent_commits(started_cluster):
+    """Under catalog commits, a parallel-replicas query must observe one consistent
+    snapshot across both nodes (the initiator's pinned ducklake_snapshot_id), never
+    failing with a changed-catalog error and never returning a torn count."""
+    import threading
+
+    for instance in (node, node2):
+        create_parallel_fresh_db_on(instance)
+
+    base = int(node.query("SELECT count() FROM `main.plain`", database="ducklake_par"))
+
+    postgres_container_id = cluster.get_instance_docker_id("postgres1")
+
+    def psql(sql):
+        run_and_check(
+            [f'docker exec {postgres_container_id} psql -U postgres -d ducklake_parallel -v ON_ERROR_STOP=1 -c "{sql}"'],
+            shell=True,
+        )
+
+    errors = []
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            try:
+                count = int(
+                    node.query(
+                        "SELECT count() FROM `main.plain`",
+                        database="ducklake_par",
+                        settings=PARALLEL_REPLICAS_SETTINGS,
+                    )
+                )
+                assert count == base, f"torn snapshot observed: count {count} != {base}"
+            except Exception as e:
+                errors.append(e)
+
+    def mutator():
+        for _ in range(40):
+            psql(
+                "WITH s AS (SELECT MAX(snapshot_id) + 1 AS next_id, MAX(schema_version) AS sv, "
+                "MAX(next_catalog_id) AS nc, MAX(next_file_id) AS nf FROM ducklake_snapshot) "
+                "INSERT INTO ducklake_snapshot SELECT next_id, now(), sv, nc, nf FROM s"
+            )
+
+    readers = [threading.Thread(target=reader) for _ in range(2)]
+    writer = threading.Thread(target=mutator)
+    for thread in readers:
+        thread.start()
+    writer.start()
+    writer.join()
+    stop.set()
+    for thread in readers:
+        thread.join()
+
+    assert not errors, f"parallel-replicas read failures during concurrent commits: {errors[:3]}"

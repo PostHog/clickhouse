@@ -295,7 +295,12 @@ DataLakeMetadataPtr DuckLakeMetadata::create(
     auto snapshot_read = forced_snapshot > 0 ? catalog->beginSnapshotReadAt(forced_snapshot) : catalog->beginSnapshotRead();
     if (forced_snapshot == 0 && snapshot_read->snapshot_id > 0 && local_context->hasQueryContext())
     {
+        /// Stamp every context the dispatch could read its settings from: the query context
+        /// (ancestor lineage) and this context itself (storage/read lineage — a
+        /// DatabaseDataLake context copy made before the pin would otherwise not see it).
+        /// The setting travels with the query packet to parallel-replicas secondaries.
         local_context->getQueryContext()->setSetting("ducklake_snapshot_id", Field(snapshot_read->snapshot_id));
+        std::const_pointer_cast<Context>(local_context)->setSetting("ducklake_snapshot_id", Field(snapshot_read->snapshot_id));
         LOG_DEBUG(
             getLogger("DuckLakeMetadata"),
             "DuckLake: pinned catalog snapshot {} for this query (propagated to parallel replicas)",

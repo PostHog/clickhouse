@@ -22,6 +22,7 @@ DuckLakeObjectSerializableInfo makeInfo()
     info.file_size_bytes = 4242;
     info.inlined_deleted_positions = {1, 5, 90};
     info.column_mapper_encoding = {{"person_id", 1}, {"props.os", 42}};
+    info.column_mapper_name_mapping = {{"personid_col", "person_id"}, {"props.os", "props.os"}};
     info.partition_constants = {
         {.column_name = "team_id", .type_name = "Int64", .value = Field(Int64(566139))},
         {.column_name = "day", .type_name = "Date", .value = Field(UInt16(19850))},
@@ -41,6 +42,7 @@ void expectEqual(const DuckLakeObjectSerializableInfo & a, const DuckLakeObjectS
     EXPECT_EQ(a.file_size_bytes, b.file_size_bytes);
     EXPECT_EQ(a.inlined_deleted_positions, b.inlined_deleted_positions);
     EXPECT_EQ(a.column_mapper_encoding, b.column_mapper_encoding);
+    EXPECT_EQ(a.column_mapper_name_mapping, b.column_mapper_name_mapping);
     ASSERT_EQ(a.partition_constants.size(), b.partition_constants.size());
     for (size_t i = 0; i < a.partition_constants.size(); ++i)
     {

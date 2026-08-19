@@ -86,6 +86,9 @@ struct DuckLakeObjectSerializableInfo
     /// Name -> field-id encoding of the per-file ColumnMapper (ducklake_add_data_files
     /// name-mapped files); empty = use the table-wide mapper.
     std::vector<std::pair<String, Int64>> column_mapper_encoding;
+    /// Dotted parquet-side path -> clickhouse name (the other half of the per-file
+    /// ColumnMapper for name-mapped files).
+    std::vector<std::pair<String, String>> column_mapper_name_mapping;
     std::vector<PartitionConstant> partition_constants;
 
     void serializeForClusterFunctionProtocol(WriteBuffer & out, size_t protocol_version) const;

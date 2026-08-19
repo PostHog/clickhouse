@@ -56,6 +56,8 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
         {
             const auto & encoding = ducklake_object->column_mapper->getStorageColumnEncoding();
             info.column_mapper_encoding.assign(encoding.begin(), encoding.end());
+            const auto & name_mapping = ducklake_object->column_mapper->getStorageColumnNameMapping();
+            info.column_mapper_name_mapping.assign(name_mapping.begin(), name_mapping.end());
         }
         info.partition_constants.reserve(ducklake_object->partition_constants.size());
         for (const auto & constant : ducklake_object->partition_constants)
@@ -110,6 +112,14 @@ ObjectInfoPtr ClusterFunctionReadTaskResponse::getObjectInfo() const
                 encoding.emplace(name, field_id);
             auto mapper = std::make_shared<ColumnMapper>();
             mapper->setStorageColumnEncoding(std::move(encoding));
+            if (!ducklake_info->column_mapper_name_mapping.empty())
+            {
+                std::unordered_map<String, String> name_mapping;
+                name_mapping.reserve(ducklake_info->column_mapper_name_mapping.size());
+                for (const auto & [parquet_path, clickhouse_name] : ducklake_info->column_mapper_name_mapping)
+                    name_mapping.emplace(parquet_path, clickhouse_name);
+                mapper->setStorageColumnNameMapping(std::move(name_mapping));
+            }
             ducklake_object->column_mapper = std::move(mapper);
         }
         ducklake_object->partition_constants.reserve(ducklake_info->partition_constants.size());
