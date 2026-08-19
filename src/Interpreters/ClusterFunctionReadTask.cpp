@@ -10,7 +10,9 @@
 #include <IO/ReadHelpers.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
+#include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeDataObjectInfo.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
+#include <DataTypes/DataTypeFactory.h>
 #include <Formats/FormatFactory.h>
 #include <Processors/Formats/Impl/ParquetBlockInputFormat.h>
 
@@ -41,6 +43,26 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
     }
 #endif
 
+    if (const auto * ducklake_object = dynamic_cast<DuckLakeDataObjectInfo *>(object.get()))
+    {
+        DuckLakeObjectSerializableInfo info;
+        info.positional_delete_files.reserve(ducklake_object->positional_delete_files.size());
+        for (const auto & delete_file : ducklake_object->positional_delete_files)
+            info.positional_delete_files.push_back({.path = delete_file.path, .delete_count = delete_file.delete_count});
+        info.record_count = ducklake_object->record_count;
+        info.file_size_bytes = ducklake_object->file_size_bytes;
+        info.inlined_deleted_positions = ducklake_object->inlined_deleted_positions;
+        if (ducklake_object->column_mapper)
+        {
+            const auto & encoding = ducklake_object->column_mapper->getStorageColumnEncoding();
+            info.column_mapper_encoding.assign(encoding.begin(), encoding.end());
+        }
+        info.partition_constants.reserve(ducklake_object->partition_constants.size());
+        for (const auto & constant : ducklake_object->partition_constants)
+            info.partition_constants.push_back({.column_name = constant.name, .type_name = constant.type->getName(), .value = constant.value});
+        ducklake_info = std::move(info);
+    }
+
     const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
     path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
     file_bucket_info = object->file_bucket_info;
@@ -67,6 +89,36 @@ ObjectInfoPtr ClusterFunctionReadTaskResponse::getObjectInfo() const
 #else
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Iceberg support is disabled");
 #endif
+    }
+    else if (ducklake_info.has_value())
+    {
+        std::vector<DuckLakeDataObjectInfo::PositionalDeleteFile> delete_files;
+        delete_files.reserve(ducklake_info->positional_delete_files.size());
+        for (const auto & delete_file : ducklake_info->positional_delete_files)
+            delete_files.push_back({.path = delete_file.path, .delete_count = delete_file.delete_count});
+        auto ducklake_object = std::make_shared<DuckLakeDataObjectInfo>(
+            path,
+            std::move(delete_files),
+            ducklake_info->record_count,
+            ducklake_info->file_size_bytes,
+            ducklake_info->inlined_deleted_positions);
+        if (!ducklake_info->column_mapper_encoding.empty())
+        {
+            std::unordered_map<String, Int64> encoding;
+            encoding.reserve(ducklake_info->column_mapper_encoding.size());
+            for (const auto & [name, field_id] : ducklake_info->column_mapper_encoding)
+                encoding.emplace(name, field_id);
+            auto mapper = std::make_shared<ColumnMapper>();
+            mapper->setStorageColumnEncoding(std::move(encoding));
+            ducklake_object->column_mapper = std::move(mapper);
+        }
+        ducklake_object->partition_constants.reserve(ducklake_info->partition_constants.size());
+        for (const auto & constant : ducklake_info->partition_constants)
+            ducklake_object->partition_constants.push_back({
+                .name = constant.column_name,
+                .type = DataTypeFactory::instance().get(constant.type_name),
+                .value = constant.value});
+        object = std::move(ducklake_object);
     }
     else
     {
@@ -129,6 +181,19 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
             writeVarUInt(0, out);
         }
     }
+
+    if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DUCKLAKE_METADATA)
+    {
+        if (ducklake_info.has_value())
+        {
+            writeVarUInt(1, out);
+            ducklake_info->serializeForClusterFunctionProtocol(out, protocol_version);
+        }
+        else
+        {
+            writeVarUInt(0, out);
+        }
+    }
 }
 
 void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in)
@@ -180,6 +245,16 @@ void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in)
         {
             iceberg_info = Iceberg::IcebergObjectSerializableInfo{};
             iceberg_info->deserializeForClusterFunctionProtocol(in, protocol_version);
+        }
+    }
+    if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DUCKLAKE_METADATA)
+    {
+        auto has_ducklake_metadata = false;
+        readVarUInt(has_ducklake_metadata, in);
+        if (has_ducklake_metadata)
+        {
+            ducklake_info = DuckLakeObjectSerializableInfo{};
+            ducklake_info->deserializeForClusterFunctionProtocol(in, protocol_version);
         }
     }
 }

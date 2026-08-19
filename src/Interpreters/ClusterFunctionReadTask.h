@@ -3,6 +3,7 @@
 #include <Storages/ObjectStorage/DataLakes/DataLakeObjectMetadata.h>
 #include <Processors/Formats/IInputFormat.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
+#include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeDataObjectInfo.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
 
 
@@ -25,6 +26,8 @@ struct ClusterFunctionReadTaskResponse
     DataLakeObjectMetadata data_lake_metadata;
     /// Iceberg object metadata
     std::optional<Iceberg::IcebergObjectSerializableInfo> iceberg_info;
+    /// DuckLake object metadata (delete files, inlined deletions, per-file mapping)
+    std::optional<DuckLakeObjectSerializableInfo> ducklake_info;
 
     /// Convert received response into ObjectInfo.
     ObjectInfoPtr getObjectInfo() const;
