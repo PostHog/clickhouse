@@ -215,6 +215,12 @@ public:
     /// subsequent reads through the session are one consistent catalog view.
     std::shared_ptr<SnapshotRead> beginSnapshotRead() const;
 
+    /// Same, but read at a caller-chosen snapshot id (parallel-replicas propagation /
+    /// time travel): the transaction still guarantees a consistent view, the id is just
+    /// not re-pinned. The id must be <= the current MAX; catalog rows are never rewritten,
+    /// so any historical id remains readable (subject to external snapshot expiry).
+    std::shared_ptr<SnapshotRead> beginSnapshotReadAt(Int64 snapshot_id) const;
+
     /// Load schema + field-id map for one table at `snapshot_id`.
     /// Throws if the table does not exist at that snapshot.
     DuckLakeTableSnapshotInfo getTableSnapshotInfo(IDuckLakeConnection & conn, const String & namespace_name, const String & table_name, Int64 snapshot_id) const;

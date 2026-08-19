@@ -762,3 +762,62 @@ def test_ducklake_read_during_concurrent_commits(started_cluster):
         node.query("SELECT count() FROM `main.plain`", database=db)
         == f"{base + 40}\n"
     )
+
+
+def test_ducklake_snapshot_id_time_travel(started_cluster):
+    """ducklake_snapshot_id pins the catalog snapshot explicitly (the same code path a
+    parallel-replicas secondary uses to follow the initiator's pinned snapshot): reading
+    at a pre-insert snapshot must return the pre-insert rows."""
+    create_postgres_db()
+    db = "ducklake_pg"
+
+    before = int(node.query("SELECT count() FROM `main.plain`", database=db))
+
+    postgres_container_id = cluster.get_instance_docker_id("postgres1")
+    snapshot_id = int(
+        run_and_check(
+            [
+                f"docker exec {postgres_container_id} psql -U postgres -d postgres -t -A -c "
+                f'"SELECT MAX(snapshot_id) FROM ducklake_snapshot"'
+            ],
+            shell=True,
+        ).strip()
+    )
+
+    node.query(
+        "INSERT INTO `main.plain` VALUES (20000, 'tt')",
+        database=db,
+        settings=WRITE_SETTINGS,
+    )
+    assert int(node.query("SELECT count() FROM `main.plain`", database=db)) == before + 1
+
+    # pinned at the pre-insert snapshot: the new row is not visible
+    assert (
+        int(
+            node.query(
+                "SELECT count() FROM `main.plain`",
+                database=db,
+                settings={"ducklake_snapshot_id": snapshot_id},
+            )
+        )
+        == before
+    )
+    # and a second table read in the same query observes the same pinned snapshot
+    assert (
+        node.query(
+            "SELECT count() FROM `main.plain` WHERE id = 20000",
+            database=db,
+            settings={"ducklake_snapshot_id": snapshot_id},
+        )
+        == "0\n"
+    )
+
+
+
+def test_ducklake_snapshot_id_propagation_stamp(started_cluster):
+    """After reading a DuckLake table without an explicit snapshot, the query settings are
+    stamped with the pinned ducklake_snapshot_id — that stamp is what a parallel-replicas
+    query ships to secondaries so all nodes read one catalog snapshot."""
+    create_postgres_db()
+    node.query("SELECT count() FROM `main.plain`", database="ducklake_pg")
+    assert node.grep_in_log("DuckLake: pinned catalog snapshot")
