@@ -36,6 +36,8 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
+#include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeDataObjectInfo.h>
+#include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeMetadata.h>
 #include <Storages/ObjectStorage/Utils.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <boost/operators.hpp>
@@ -578,6 +580,47 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         if (!object_info || object_info->getPath().empty())
             return {};
+
+        /// A synthetic DuckLake inlined-data object is not a file: read its rows from
+        /// the catalog (via the lake metadata at the pinned snapshot) instead of
+        /// opening an object-storage path.
+        if (auto * ducklake_object = dynamic_cast<DuckLakeDataObjectInfo *>(object_info.get());
+            ducklake_object && !ducklake_object->inlined_table_name.empty())
+        {
+            auto * ducklake_metadata = dynamic_cast<DuckLakeMetadata *>(configuration->getExternalMetadata());
+            if (!ducklake_metadata)
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "DuckLake inlined object '{}' on a non-DuckLake configuration",
+                    ducklake_object->inlined_table_name);
+
+            /// Tasks arriving from another replica carry no object metadata (files
+            /// re-fetch it lazily, which would fail for the synthetic path).
+            if (!object_info->getObjectMetadata())
+            {
+                ObjectMetadata placeholder_metadata;
+                placeholder_metadata.size_bytes = 0;
+                placeholder_metadata.is_size_known = true;
+                object_info->setObjectMetadata(placeholder_metadata);
+            }
+
+            std::optional<UInt64> count_only;
+            if (need_only_count && ducklake_object->record_count.has_value())
+                count_only = static_cast<UInt64>(*ducklake_object->record_count);
+
+            auto pipe = ducklake_metadata->createInlinedDataPipe(
+                ducklake_object->inlined_table_name,
+                ducklake_object->inlined_schema_version,
+                read_from_format_info,
+                context_,
+                max_block_size,
+                count_only);
+
+            auto source = pipe.getProcessors().empty() ? nullptr : std::dynamic_pointer_cast<ISource>(pipe.getProcessors().front());
+            auto pipeline = std::make_unique<QueryPipeline>(std::move(pipe));
+            auto pulling = std::make_unique<PullingPipelineExecutor>(*pipeline);
+            return ReaderHolder(object_info, nullptr, std::move(source), std::move(pipeline), std::move(pulling));
+        }
 
         if (!object_info->getObjectMetadata())
         {

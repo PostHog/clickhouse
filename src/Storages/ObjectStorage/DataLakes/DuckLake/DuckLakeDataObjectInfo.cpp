@@ -82,6 +82,12 @@ void DuckLakeObjectSerializableInfo::serializeForClusterFunctionProtocol(WriteBu
         writeStringBinary(constant.type_name, out);
         writeFieldBinary(constant.value, out);
     }
+
+    if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DUCKLAKE_INLINED)
+    {
+        writeStringBinary(inlined_table_name, out);
+        writeVarInt(inlined_schema_version, out);
+    }
 }
 
 void DuckLakeObjectSerializableInfo::deserializeForClusterFunctionProtocol(ReadBuffer & in, size_t protocol_version)
@@ -162,6 +168,12 @@ void DuckLakeObjectSerializableInfo::deserializeForClusterFunctionProtocol(ReadB
         readStringBinary(constant.type_name, in);
         constant.value = readFieldBinary(in);
         partition_constants.push_back(std::move(constant));
+    }
+
+    if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DUCKLAKE_INLINED)
+    {
+        readStringBinary(inlined_table_name, in);
+        readVarInt(inlined_schema_version, in);
     }
 }
 

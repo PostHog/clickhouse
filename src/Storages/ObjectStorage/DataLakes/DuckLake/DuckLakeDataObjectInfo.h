@@ -55,6 +55,16 @@ struct DuckLakeDataObjectInfo : public ObjectInfo
     /// Hive partition columns whose values come from the catalog rather than the parquet
     /// content (is_partition name mappings).
     std::vector<DuckLakePartitionConstantsTransform::ConstantColumn> partition_constants;
+
+    /// Set when this object is not a parquet file but a DuckLake inlined-data table
+    /// (rows stored in the catalog, not yet flushed): the reading node reads the rows
+    /// from the catalog at the pinned snapshot instead of opening a file. Emitting
+    /// inlined tables as objects is what lets distributed reads hand them to exactly
+    /// one replica (an additional per-node pipe would duplicate them).
+    String inlined_table_name;
+    /// ducklake_inlined_data_tables.schema_version for inlined objects (column names in
+    /// the inlined table are as of this global schema version).
+    Int64 inlined_schema_version = -1;
 };
 
 using DuckLakeDataObjectInfoPtr = std::shared_ptr<DuckLakeDataObjectInfo>;
@@ -90,6 +100,9 @@ struct DuckLakeObjectSerializableInfo
     /// ColumnMapper for name-mapped files).
     std::vector<std::pair<String, String>> column_mapper_name_mapping;
     std::vector<PartitionConstant> partition_constants;
+    /// Non-empty when this task is an inlined-data table, not a parquet file.
+    String inlined_table_name;
+    Int64 inlined_schema_version = -1;
 
     void serializeForClusterFunctionProtocol(WriteBuffer & out, size_t protocol_version) const;
     void deserializeForClusterFunctionProtocol(ReadBuffer & in, size_t protocol_version);

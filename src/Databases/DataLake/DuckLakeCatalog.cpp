@@ -258,6 +258,9 @@ public:
 
     DuckLakeQueryResult exec(const String & query) override
     {
+        /// See DuckLakePostgresReadTx::exec: reader streams can hit the catalog
+        /// concurrently, and a sqlite handle is not thread-safe.
+        std::lock_guard lock(exec_mutex);
         return sqliteExec(db.get(), query);
     }
 
@@ -280,6 +283,7 @@ public:
 
 private:
     SQLitePtr db;
+    std::mutex exec_mutex;
 };
 
 std::unique_ptr<IDuckLakeConnection> DuckLakeSQLiteConnection::beginReadTx()
@@ -406,6 +410,10 @@ public:
     DuckLakeQueryResult exec(const String & query) override
     try
     {
+        /// Multiple reader streams can execute catalog statements concurrently
+        /// (e.g. several inlined-data objects materializing in parallel); libpqxx
+        /// forbids overlapping commands on one transaction, so serialize them.
+        std::lock_guard lock(exec_mutex);
         return pqxxMapResult(tx->exec(query));
     }
     catch (const pqxx::broken_connection & e)
@@ -442,6 +450,7 @@ private:
     std::unique_ptr<pqxx::connection> connection;
     std::unique_ptr<Transaction> tx;
     String catalog_schema;
+    std::mutex exec_mutex;
 };
 
 std::unique_ptr<IDuckLakeConnection> DuckLakePostgresConnection::beginReadTx()

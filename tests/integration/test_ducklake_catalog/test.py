@@ -881,6 +881,16 @@ def create_postgres_db_on(instance):
     )
 
 
+def create_postgres2_db_on(instance):
+    instance.query("DROP DATABASE IF EXISTS ducklake_pg2 SYNC")
+    instance.query(
+        "CREATE DATABASE ducklake_pg2 ENGINE = DataLakeCatalog('ducklake')"
+        " SETTINGS catalog_type = 'ducklake', ducklake_backend = 'postgres',"
+        " ducklake_connection_string = 'host=postgres1 port=5432 dbname=ducklake2 user=postgres';",
+        settings={"allow_experimental_database_ducklake_catalog": 1},
+    )
+
+
 def create_postgres3_db_on(instance):
     instance.query("DROP DATABASE IF EXISTS ducklake_pg3 SYNC")
     instance.query(
@@ -1041,3 +1051,35 @@ def test_ducklake_count_from_metadata_parallel_replicas(started_cluster):
         == single
     )
     assert single == "3\n"
+
+
+def test_ducklake_parallel_replicas_inlined_data(started_cluster):
+    """Inlined data rows (catalog-stored, not yet flushed) must be read by EXACTLY ONE
+    replica: they are emitted as synthetic tasks. Before this, every replica added the
+    inlined-data pipe and the rows were duplicated (101 -> 202)."""
+    for instance in (node, node2):
+        create_postgres2_db_on(instance)
+
+    # 100 file rows, 3 inlined deletions, 5 inlined inserts (one of them deleted)
+    expected = node.query("SELECT count() FROM `main.inlined_mixed`", database="ducklake_pg2")
+    assert expected == "101\n"
+    assert (
+        node.query(
+            "SELECT count() FROM `main.inlined_mixed`",
+            database="ducklake_pg2",
+            settings=PARALLEL_REPLICAS_SETTINGS,
+        )
+        == "101\n"
+    )
+    # and the inlined rows themselves are right, not just the count
+    expected_rows = node.query(
+        "SELECT * FROM `main.inlined_mixed` WHERE id >= 1000 ORDER BY id", database="ducklake_pg2"
+    )
+    assert (
+        node.query(
+            "SELECT * FROM `main.inlined_mixed` WHERE id >= 1000 ORDER BY id",
+            database="ducklake_pg2",
+            settings=PARALLEL_REPLICAS_SETTINGS,
+        )
+        == expected_rows
+    )

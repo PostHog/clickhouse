@@ -62,6 +62,8 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
         info.partition_constants.reserve(ducklake_object->partition_constants.size());
         for (const auto & constant : ducklake_object->partition_constants)
             info.partition_constants.push_back({.column_name = constant.name, .type_name = constant.type->getName(), .value = constant.value});
+        info.inlined_table_name = ducklake_object->inlined_table_name;
+        info.inlined_schema_version = ducklake_object->inlined_schema_version;
         ducklake_info = std::move(info);
     }
 
@@ -128,6 +130,8 @@ ObjectInfoPtr ClusterFunctionReadTaskResponse::getObjectInfo() const
                 .name = constant.column_name,
                 .type = DataTypeFactory::instance().get(constant.type_name),
                 .value = constant.value});
+        ducklake_object->inlined_table_name = ducklake_info->inlined_table_name;
+        ducklake_object->inlined_schema_version = ducklake_info->inlined_schema_version;
         object = std::move(ducklake_object);
     }
     else

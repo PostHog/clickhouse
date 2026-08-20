@@ -60,6 +60,18 @@ public:
     /// rows inlined in the catalog. Exact at the pinned snapshot; no file reads.
     std::optional<UInt64> getTotalCountFromMetadata() const override;
 
+    /// Pipe producing the rows of one inlined-data table (a synthetic object emitted by
+    /// iterate()), resolving the table's SQL columns at its schema version into the
+    /// table schema at the pinned snapshot. With count_only set, emits just the row
+    /// count (the unfiltered count(*) path — no row materialization).
+    Pipe createInlinedDataPipe(
+        const String & inlined_table_name,
+        Int64 inlined_schema_version,
+        const ReadFromFormatInfo & info,
+        ContextPtr context,
+        size_t max_block_size,
+        std::optional<UInt64> count_only = std::nullopt) const;
+
     bool supportsWrites() const override;
     bool supportsParallelInsert() const override;
 
@@ -94,9 +106,9 @@ public:
         FormatParserSharedResourcesPtr parser_shared_resources,
         ContextPtr context) const override;
 
-    /// Rows inlined in the catalog database (DuckLake data inlining) are not files; produce
-    /// them as an additional pipe united with the file-reading pipes. Returns an empty pipe
-    /// when the table has no inlined rows visible at the pinned snapshot.
+    /// Rows inlined in the catalog database (DuckLake data inlining) are not files; they
+    /// are emitted as synthetic objects by iterate() and read via createInlinedDataPipe.
+    /// Returns an empty pipe always (see the implementation comment).
     Pipe getAdditionalReadPipe(
         const ReadFromFormatInfo & info,
         StorageMetadataPtr storage_metadata_snapshot,

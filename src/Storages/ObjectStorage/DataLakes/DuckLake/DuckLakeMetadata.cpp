@@ -11,6 +11,7 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/ExpressionActions.h>
+#include <Processors/Chunk.h>
 #include <Processors/Transforms/ExtractColumnsTransform.h>
 #include <Processors/Transforms/FilterTransform.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeObjectMetadata.h>
@@ -504,6 +505,33 @@ ObjectIterator DuckLakeMetadata::iterate(
             table_id,
             snapshot_id);
 
+    /// Inlined data rows (catalog-stored, not yet flushed to parquet) are emitted as
+    /// synthetic objects so that distributed reads hand each inlined table to exactly
+    /// one replica. The reading node resolves the object back to the catalog via
+    /// inlined_table_name at the pinned snapshot (identical on every replica thanks to
+    /// ducklake_snapshot_id propagation).
+    for (const auto & inlined_table : catalog->getInlinedDataTables(*snapshot_read->conn, table_id))
+    {
+        const UInt64 row_count = catalog->getInlinedRowCount(*snapshot_read->conn, inlined_table.table_name, snapshot_id);
+        if (row_count == 0)
+            continue;
+        auto info = std::make_shared<DuckLakeDataObjectInfo>(
+            "ducklake-inlined://" + inlined_table.table_name,
+            std::vector<DuckLakeDataObjectInfo::PositionalDeleteFile>{},
+            static_cast<Int64>(row_count),
+            std::nullopt,
+            std::vector<UInt64>{});
+        info->inlined_table_name = inlined_table.table_name;
+        info->inlined_schema_version = inlined_table.schema_version;
+        /// The object reader asserts every object carries metadata; inlined rows have
+        /// no meaningful size, so stamp a zero-size placeholder.
+        ObjectMetadata placeholder_metadata;
+        placeholder_metadata.size_bytes = 0;
+        placeholder_metadata.is_size_known = true;
+        info->setObjectMetadata(placeholder_metadata);
+        infos.push_back(std::move(info));
+    }
+
     return std::make_shared<DuckLakeObjectIterator>(std::move(infos));
 }
 
@@ -584,39 +612,26 @@ String DuckLakeMetadata::toObjectPath(const String & path, bool path_is_relative
 }
 
 Pipe DuckLakeMetadata::getAdditionalReadPipe(
-    const ReadFromFormatInfo & info,
+    const ReadFromFormatInfo & /*info*/,
     StorageMetadataPtr /*storage_metadata_snapshot*/,
     ContextPtr /*context*/,
     size_t /*max_block_size*/) const
 {
-    const auto inlined_tables = catalog->getInlinedDataTables(*snapshot_read->conn, table_id);
-    if (inlined_tables.empty())
-        return {};
+    /// Inlined rows are emitted as synthetic objects by iterate(): local reads pipe
+    /// them through the object reader and distributed reads hand each inlined table
+    /// to exactly one replica. A per-node additional pipe would duplicate them.
+    return {};
+}
 
-    struct InlinedTableData
-    {
-        Int64 schema_version;
-        std::vector<String> column_names;
-        std::vector<std::vector<std::optional<String>>> rows;
-    };
-    std::vector<InlinedTableData> tables_with_rows;
-    for (const auto & inlined_table : inlined_tables)
-    {
-        auto [column_names, rows] = catalog->getInlinedRows(*snapshot_read->conn, inlined_table.table_name, snapshot_id);
-        if (!rows.empty())
-            tables_with_rows.push_back(InlinedTableData{inlined_table.schema_version, std::move(column_names), std::move(rows)});
-    }
-    if (tables_with_rows.empty())
-        return {};
-
-    /// Virtual columns (_path, _file, ...) have no meaning for catalog-stored rows.
-    if (!info.requested_virtual_columns.empty())
-        throw Exception(
-            ErrorCodes::SUPPORT_IS_DISABLED,
-            "Virtual columns are not supported for DuckLake tables with inlined data (table id {})",
-            table_id);
-
-    /// Columns the source must produce: requested columns plus the inputs of the row-level
+Pipe DuckLakeMetadata::createInlinedDataPipe(
+    const String & inlined_table_name,
+    Int64 inlined_schema_version,
+    const ReadFromFormatInfo & info,
+    ContextPtr /*context*/,
+    size_t /*max_block_size*/,
+    std::optional<UInt64> count_only) const
+{
+    /// Columns the pipe must produce: requested columns plus the inputs of the row-level
     /// filter and prewhere (the fallback FilterTransforms run after us).
     NameSet needed_columns;
     const auto add_needed = [&](const NamesAndTypesList & columns)
@@ -647,81 +662,91 @@ Pipe DuckLakeMetadata::getAdditionalReadPipe(
                 table_id);
     }
 
+    const std::vector<NameAndTypePair> header_columns_vec(header_columns.begin(), header_columns.end());
+    Block header;
+    for (const auto & column : header_columns)
+        header.insert({column.type->createColumn(), column.type, column.name});
+
+    if (count_only.has_value())
+    {
+        /// Count-only: no row materialization, just the catalog-side count.
+        std::vector<Chunk> chunks;
+        if (!header_columns_vec.empty())
+            chunks.push_back(cloneConstWithDefault(Chunk{header.getColumns(), 0}, *count_only));
+        else
+            chunks.emplace_back(Columns{}, *count_only);
+        return Pipe(std::make_shared<DuckLakeInlinedDataSource>(std::make_shared<const Block>(header), std::move(chunks)));
+    }
+
+    auto [column_names, rows] = catalog->getInlinedRows(*snapshot_read->conn, inlined_table_name, snapshot_id);
+
     const auto & field_id_map = column_mapper->getStorageColumnEncoding();
     const auto schema_version_snapshots = catalog->getSchemaVersionFirstSnapshots(*snapshot_read->conn);
     const auto column_history = catalog->getColumnRows(*snapshot_read->conn, table_id);
     const bool postgres_backend = catalog->isPostgres();
 
-    const std::vector<NameAndTypePair> header_columns_vec(header_columns.begin(), header_columns.end());
+    /// SQL columns of the inlined table carry the column names as of its (global)
+    /// schema version; resolve them to column ids via the column history visible at
+    /// the first snapshot stamped with that version.
+    const auto version_it = schema_version_snapshots.lower_bound(inlined_schema_version);
+    if (version_it == schema_version_snapshots.end())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "DuckLake inlined data table has unknown schema version {}",
+            inlined_schema_version);
+    const Int64 version_snapshot = version_it->second;
 
-    std::vector<Chunk> chunks;
-    for (const auto & table_data : tables_with_rows)
+    std::unordered_map<String, Int64> id_by_version_name;
+    for (const auto & column : column_history)
     {
-        /// SQL columns of this inlined table carry the column names as of its (global)
-        /// schema version; resolve them to column ids via the column history visible at
-        /// the first snapshot stamped with that version.
-        const auto version_it = schema_version_snapshots.lower_bound(table_data.schema_version);
-        if (version_it == schema_version_snapshots.end())
-            throw Exception(
-                ErrorCodes::BAD_ARGUMENTS,
-                "DuckLake inlined data table has unknown schema version {}",
-                table_data.schema_version);
-        const Int64 version_snapshot = version_it->second;
-
-        std::unordered_map<String, Int64> id_by_version_name;
-        for (const auto & column : column_history)
-        {
-            if (column.isVisibleAt(version_snapshot))
-                id_by_version_name[column.name] = column.column_id;
-        }
-
-        /// Map every header column to its SQL column index in this inlined table (or none
-        /// when the column was added after this schema version).
-        std::vector<std::optional<size_t>> sql_index_by_header_column;
-        sql_index_by_header_column.reserve(header_columns_vec.size());
-        for (const auto & column : header_columns_vec)
-        {
-            const auto field_it = field_id_map.find(column.name);
-            if (field_it == field_id_map.end())
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "DuckLake column '{}' is missing in the field id map", column.name);
-            std::optional<size_t> sql_index;
-            for (size_t i = 0; i < table_data.column_names.size(); ++i)
-            {
-                const auto id_it = id_by_version_name.find(table_data.column_names[i]);
-                if (id_it != id_by_version_name.end() && id_it->second == field_it->second)
-                {
-                    sql_index = i;
-                    break;
-                }
-            }
-            sql_index_by_header_column.push_back(sql_index);
-        }
-
-        const size_t num_rows = table_data.rows.size();
-        Columns columns;
-        columns.reserve(header_columns_vec.size());
-        for (size_t c = 0; c < header_columns_vec.size(); ++c)
-        {
-            const auto & column = header_columns_vec[c];
-            const auto sql_index = sql_index_by_header_column[c];
-            if (!sql_index.has_value())
-            {
-                /// Column added after this inlined table's schema version: fill with defaults.
-                columns.push_back(column.type->createColumn()->cloneResized(num_rows));
-                continue;
-            }
-            std::vector<std::optional<String>> values;
-            values.reserve(num_rows);
-            for (const auto & row : table_data.rows)
-                values.push_back(row[*sql_index]);
-            columns.push_back(DuckLake::buildInlinedColumn(values, column.type, postgres_backend));
-        }
-        chunks.emplace_back(std::move(columns), num_rows);
+        if (column.isVisibleAt(version_snapshot))
+            id_by_version_name[column.name] = column.column_id;
     }
 
-    Block header;
-    for (const auto & column : header_columns)
-        header.insert({column.type->createColumn(), column.type, column.name});
+    /// Map every header column to its SQL column index in the inlined table (or none
+    /// when the column was added after this schema version).
+    std::vector<std::optional<size_t>> sql_index_by_header_column;
+    sql_index_by_header_column.reserve(header_columns_vec.size());
+    for (const auto & column : header_columns_vec)
+    {
+        const auto field_it = field_id_map.find(column.name);
+        if (field_it == field_id_map.end())
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "DuckLake column '{}' is missing in the field id map", column.name);
+        std::optional<size_t> sql_index;
+        for (size_t i = 0; i < column_names.size(); ++i)
+        {
+            const auto id_it = id_by_version_name.find(column_names[i]);
+            if (id_it != id_by_version_name.end() && id_it->second == field_it->second)
+            {
+                sql_index = i;
+                break;
+            }
+        }
+        sql_index_by_header_column.push_back(sql_index);
+    }
+
+    const size_t num_rows = rows.size();
+    Columns columns;
+    columns.reserve(header_columns_vec.size());
+    for (size_t c = 0; c < header_columns_vec.size(); ++c)
+    {
+        const auto & column = header_columns_vec[c];
+        const auto sql_index = sql_index_by_header_column[c];
+        if (!sql_index.has_value())
+        {
+            /// Column added after this inlined table's schema version: fill with defaults.
+            columns.push_back(column.type->createColumn()->cloneResized(num_rows));
+            continue;
+        }
+        std::vector<std::optional<String>> values;
+        values.reserve(num_rows);
+        for (const auto & row : rows)
+            values.push_back(row[*sql_index]);
+        columns.push_back(DuckLake::buildInlinedColumn(values, column.type, postgres_backend));
+    }
+
+    std::vector<Chunk> chunks;
+    chunks.emplace_back(std::move(columns), num_rows);
 
     /// The source materializes whole top-level columns; rebuild requested subcolumns
     /// (`s.x`) as proper subcolumn pairs so ExtractColumnsTransform can resolve them
