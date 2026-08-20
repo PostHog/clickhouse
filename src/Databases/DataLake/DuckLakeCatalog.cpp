@@ -1591,6 +1591,17 @@ DuckLakeCatalog::getInlinedRows(IDuckLakeConnection & conn, const String & inlin
     return {std::move(result.column_names), std::move(result.rows)};
 }
 
+UInt64 DuckLakeCatalog::getInlinedRowCount(IDuckLakeConnection & conn, const String & inlined_table, Int64 snapshot_id) const
+{
+    const auto result = conn.exec(fmt::format(
+        "SELECT COUNT(*) FROM {} inlined WHERE {}",
+        conn.qualified(inlined_table),
+        visibilityPredicate(snapshot_id, "inlined")));
+    if (result.rows.empty())
+        return 0;
+    return static_cast<UInt64>(parseInt64(result.rows[0][0], "count"));
+}
+
 std::map<Int64, Int64> DuckLakeCatalog::getSchemaVersionFirstSnapshots(IDuckLakeConnection & conn) const
 {
     const auto result = conn.exec(fmt::format(

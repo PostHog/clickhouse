@@ -250,6 +250,32 @@ DuckLakeMetadata::DuckLakeMetadata(
 {
 }
 
+
+std::optional<UInt64> DuckLakeMetadata::getTotalCountFromMetadata() const
+{
+    /// The listing carries exact per-file record counts and positional delete counts;
+    /// stats/partition side reads are useless here, so skip them.
+    DuckLakeListingOptions options;
+    options.stats_column_ids = std::vector<Int64>{};
+    options.fetch_partition_values = false;
+    auto listing = catalog->getDataFiles(*snapshot_read->conn, table_id, snapshot_id, options);
+
+    UInt64 total = 0;
+    for (const auto & file : listing.files)
+    {
+        total += static_cast<UInt64>(file.record_count);
+        for (const auto & delete_file : file.delete_files)
+            total -= static_cast<UInt64>(delete_file.delete_count);
+        total -= file.inlined_deleted_positions.size();
+    }
+
+    /// Rows inlined in the catalog (not yet flushed to parquet) are part of the table.
+    for (const auto & inlined_table : catalog->getInlinedDataTables(*snapshot_read->conn, table_id))
+        total += catalog->getInlinedRowCount(*snapshot_read->conn, inlined_table.table_name, snapshot_id);
+
+    return total;
+}
+
 DataLakeMetadataPtr DuckLakeMetadata::create(
     const ObjectStoragePtr & object_storage,
     const StorageObjectStorageConfigurationWeakPtr & configuration,

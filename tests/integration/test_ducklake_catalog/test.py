@@ -998,3 +998,46 @@ def test_ducklake_parallel_replicas_under_concurrent_commits(started_cluster):
         thread.join()
 
     assert not errors, f"parallel-replicas read failures during concurrent commits: {errors[:3]}"
+
+
+def test_ducklake_count_from_metadata(started_cluster):
+    """Unfiltered count(*) is answered from the catalog listing (exact record/delete
+    counts at the pinned snapshot) instead of opening every file's footer. The answer
+    must match the read pipeline exactly, including positional deletes, inlined
+    deletions, and rows inlined in the catalog."""
+    # a pristine fixture copy: the write tests mutate ducklake_pg.main.plain and can
+    # race this test under xdist. ducklake_pg2 is never written by any test.
+    create_parallel_fresh_db_on(node)
+    create_postgres2_db()
+
+    # positional deletes: 4 file rows minus 2 deleted
+    assert node.query("SELECT count() FROM `main.with_deletes`", database="ducklake_par") == "2\n"
+    # 100 file rows, 3 inlined deletions, 5 inlined inserts (one of them deleted)
+    assert node.query("SELECT count() FROM `main.inlined_mixed`", database="ducklake_pg2") == "101\n"
+    assert node.query("SELECT count() FROM `main.plain`", database="ducklake_par") == "3\n"
+    # schema evolution: 5 rows across files written at different schema versions
+    assert node.query("SELECT count() FROM `main.evolved`", database="ducklake_par") == "5\n"
+    # filtered count takes the generic path
+    assert (
+        node.query("SELECT count() FROM `main.plain` WHERE id = 1", database="ducklake_par") == "1\n"
+    )
+    # the metadata path was taken (logged at the read step)
+    assert node.grep_in_log("Answering count from catalog metadata")
+
+
+def test_ducklake_count_from_metadata_parallel_replicas(started_cluster):
+    """The metadata count path engages on the parallel-replicas initiator and returns
+    the same answer as the single-node count (the initiator's pinned snapshot)."""
+    for instance in (node, node2):
+        create_parallel_fresh_db_on(instance)
+
+    single = node.query("SELECT count() FROM `main.plain`", database="ducklake_par")
+    assert (
+        node.query(
+            "SELECT count() FROM `main.plain`",
+            database="ducklake_par",
+            settings=PARALLEL_REPLICAS_SETTINGS,
+        )
+        == single
+    )
+    assert single == "3\n"

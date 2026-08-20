@@ -256,6 +256,10 @@ public:
     std::pair<std::vector<String>, std::vector<std::vector<std::optional<String>>>>
     getInlinedRows(IDuckLakeConnection & conn, const String & inlined_table, Int64 snapshot_id) const;
 
+    /// Number of rows of `inlined_table` visible at `snapshot_id` (COUNT with the
+    /// begin/end snapshot visibility predicate). 0 when the table does not exist.
+    UInt64 getInlinedRowCount(IDuckLakeConnection & conn, const String & inlined_table, Int64 snapshot_id) const;
+
     /// Global schema_version -> first snapshot_id that has it (ducklake_snapshot is global).
     /// Inlined data tables are named with the global schema version at their creation, so
     /// this maps an inlined table's schema_version to the snapshot whose visible column

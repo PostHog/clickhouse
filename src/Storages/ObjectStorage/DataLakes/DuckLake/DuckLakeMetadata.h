@@ -55,6 +55,11 @@ public:
 
     NamesAndTypesList getTableSchema(ContextPtr /*local_context*/) const override { return schema; }
 
+    /// Unfiltered count(*) answered from the catalog listing: SUM(record_count) over
+    /// visible data files, minus positional delete counts and inlined deletions, plus
+    /// rows inlined in the catalog. Exact at the pinned snapshot; no file reads.
+    std::optional<UInt64> getTotalCountFromMetadata() const override;
+
     bool supportsWrites() const override;
     bool supportsParallelInsert() const override;
 
