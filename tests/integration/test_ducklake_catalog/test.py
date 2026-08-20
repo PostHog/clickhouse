@@ -1108,6 +1108,9 @@ def test_ducklake_postgres_password_env(started_cluster):
     # is always set in the server container). A missing variable must fail the attach
     # loudly rather than retry doomed auth.
     node.query("DROP DATABASE IF EXISTS ducklake_pg_pwenv SYNC")
+    # earlier write tests mutate the shared catalog, so compare against the same
+    # catalog attached under another database rather than a fixed row count
+    create_postgres_db()
     node.query(
         "CREATE DATABASE ducklake_pg_pwenv ENGINE = DataLakeCatalog('ducklake')"
         " SETTINGS catalog_type = 'ducklake', ducklake_backend = 'postgres',"
@@ -1115,10 +1118,9 @@ def test_ducklake_postgres_password_env(started_cluster):
         " password_env=HOSTNAME';",
         settings={"allow_experimental_database_ducklake_catalog": 1},
     )
-    assert (
-        node.query("SELECT count() FROM `main.plain`", database="ducklake_pg_pwenv")
-        == "3\n"
-    )
+    assert node.query(
+        "SELECT count() FROM `main.plain`", database="ducklake_pg_pwenv"
+    ) == node.query("SELECT count() FROM `main.plain`", database="ducklake_pg")
     node.query("DROP DATABASE ducklake_pg_pwenv SYNC")
 
     node.query("DROP DATABASE IF EXISTS ducklake_pg_pwenv SYNC")
@@ -1146,6 +1148,11 @@ def test_ducklake_out_of_path_data_file(started_cluster):
     node.exec_in_container(["bash", "-c", f"mkdir -p $(dirname {dst}) && cp {src} {dst}"])
     pg = cluster.get_instance_docker_id("postgres1")
     create_postgres_db()
+    # earlier write tests may have mutated main.plain (even end-snapshotting its
+    # original file), so measure the current sum and expect the copy's ids 1,2,3 on top
+    sum_before = int(
+        node.query("SELECT ifNull(sum(id), 0) FROM `main.plain`", database="ducklake_pg")
+    )
     register = (
         "INSERT INTO ducklake_data_file (data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path, path_is_relative, file_format, record_count, file_size_bytes, footer_size, row_id_start, partition_id, encryption_key, mapping_id, partial_max) "
         f"VALUES (1000, 1, 17, NULL, NULL, '{dst}', FALSE, 'parquet', 3, 309, 220, 1000, NULL, NULL, NULL, NULL); "
@@ -1156,7 +1163,8 @@ def test_ducklake_out_of_path_data_file(started_cluster):
         run_and_check([f'docker exec {pg} psql -U postgres -d postgres -c "{register}"'], shell=True)
         # sum() forces real file reads (a catalog-only count() would not prove the mapping)
         assert (
-            node.query("SELECT sum(id) FROM `main.plain`", database="ducklake_pg") == "12\n"
+            node.query("SELECT ifNull(sum(id), 0) FROM `main.plain`", database="ducklake_pg")
+            == f"{sum_before + 6}\n"
         )
     finally:
         run_and_check(
