@@ -1097,3 +1097,38 @@ def test_ducklake_parallel_replicas_inlined_data(started_cluster):
         )
         == expected_rows
     )
+
+
+def test_ducklake_postgres_password_env(started_cluster):
+    # password_env=<VAR> in ducklake_connection_string substitutes the named env var's
+    # value as the libpq password at connect time, keeping secrets out of the DDL (the
+    # compose postgres uses trust auth, so any substituted value authenticates; HOSTNAME
+    # is always set in the server container). A missing variable must fail the attach
+    # loudly rather than retry doomed auth.
+    node.query("DROP DATABASE IF EXISTS ducklake_pg_pwenv SYNC")
+    node.query(
+        "CREATE DATABASE ducklake_pg_pwenv ENGINE = DataLakeCatalog('ducklake')"
+        " SETTINGS catalog_type = 'ducklake', ducklake_backend = 'postgres',"
+        " ducklake_connection_string = 'host=postgres1 port=5432 dbname=postgres user=postgres"
+        " password_env=HOSTNAME';",
+        settings={"allow_experimental_database_ducklake_catalog": 1},
+    )
+    assert (
+        node.query("SELECT count() FROM `main.inlined_mixed`", database="ducklake_pg_pwenv")
+        == "101\n"
+    )
+    node.query("DROP DATABASE ducklake_pg_pwenv SYNC")
+
+    node.query("DROP DATABASE IF EXISTS ducklake_pg_pwenv SYNC")
+    try:
+        node.query(
+            "CREATE DATABASE ducklake_pg_pwenv ENGINE = DataLakeCatalog('ducklake')"
+            " SETTINGS catalog_type = 'ducklake', ducklake_backend = 'postgres',"
+            " ducklake_connection_string = 'host=postgres1 port=5432 dbname=postgres user=postgres"
+            " password_env=DUCKLAKE_DEFINITELY_MISSING_PASSWORD_VAR';",
+            settings={"allow_experimental_database_ducklake_catalog": 1},
+        )
+        assert False, "attach with a missing password_env variable must fail"
+    except QueryRuntimeException as e:
+        assert "password_env" in str(e)
+        assert "DUCKLAKE_DEFINITELY_MISSING_PASSWORD_VAR" in str(e)

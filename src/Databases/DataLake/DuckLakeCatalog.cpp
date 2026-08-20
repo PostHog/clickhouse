@@ -18,6 +18,9 @@
 #endif
 
 #if USE_LIBPQXX
+#include <cctype>
+#include <cstdlib>
+
 #include <pqxx/pqxx>
 #endif
 
@@ -37,6 +40,83 @@ extern const int LOGICAL_ERROR;
 
 namespace
 {
+
+#if USE_LIBPQXX
+/// libpq conninfo helper: substitute `password_env=VAR` tokens with the referenced
+/// environment variable's value, appended as a properly quoted `password='...'` parameter.
+///
+/// Rationale: PGPASSWORD is process-wide, so a node attaching several DuckLake postgres
+/// catalogs with different passwords cannot use it; and putting password= in
+/// ducklake_connection_string would store the secret in the CREATE DATABASE DDL (system
+/// tables, logs). password_env lets each catalog name its own env var instead.
+/// A missing or empty variable fails the attach loudly rather than retrying doomed auth.
+String resolveConnInfoPasswordFromEnv(const String & conninfo)
+{
+    static const String marker = "password_env=";
+    if (conninfo.find(marker) == String::npos)
+        return conninfo;
+
+    String password_value;
+    String result;
+    result.reserve(conninfo.size());
+
+    size_t pos = 0;
+    while (pos < conninfo.size())
+    {
+        size_t token_end = conninfo.find_first_of(" \t", pos);
+        if (token_end == String::npos)
+            token_end = conninfo.size();
+        String token = conninfo.substr(pos, token_end - pos);
+        if (token.starts_with(marker))
+        {
+            String var = token.substr(marker.size());
+            bool valid = !var.empty() && (std::isalpha(static_cast<unsigned char>(var[0])) || var[0] == '_');
+            for (size_t i = 1; valid && i < var.size(); ++i)
+                valid = std::isalnum(static_cast<unsigned char>(var[i])) || var[i] == '_';
+            if (!valid)
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Invalid environment variable name '{}' in ducklake_connection_string password_env parameter",
+                    var);
+            const char * value = std::getenv(var.c_str()); // NOLINT(concurrency-mt-unsafe): read-only env lookup at attach time
+            if (!value || !*value)
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "ducklake_connection_string references environment variable '{}' via password_env, "
+                    "but it is not set or empty in the server environment",
+                    var);
+            if (!password_value.empty() && password_value != value)
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "ducklake_connection_string contains multiple password_env parameters with different values");
+            password_value = value;
+        }
+        else
+        {
+            if (!result.empty())
+                result.push_back(' ');
+            result += token;
+        }
+        pos = token_end;
+        while (pos < conninfo.size() && (conninfo[pos] == ' ' || conninfo[pos] == '\t'))
+            ++pos;
+    }
+
+    if (!password_value.empty())
+    {
+        // libpq quoting: single-quote the value, backslash-escaping ' and \.
+        result += " password='";
+        for (char c : password_value)
+        {
+            if (c == '\'' || c == '\\')
+                result.push_back('\\');
+            result.push_back(c);
+        }
+        result.push_back('\'');
+    }
+    return result;
+}
+#endif
 
 /// Quoting helpers. Identifiers and literals embedded into catalog SQL always come from
 /// either the catalog itself or from already-validated settings, but we quote anyway.
@@ -604,7 +684,8 @@ DuckLakeCatalog::DuckLakeCatalog(
     else if (backend_ == "postgres")
     {
 #if USE_LIBPQXX
-        connection = std::make_unique<DuckLakePostgresConnection>(connection_string_, catalog_schema_);
+        connection = std::make_unique<DuckLakePostgresConnection>(
+            resolveConnInfoPasswordFromEnv(connection_string_), catalog_schema_);
 #else
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "ClickHouse was compiled without PostgreSQL support");
 #endif
