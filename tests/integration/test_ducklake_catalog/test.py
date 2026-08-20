@@ -414,11 +414,13 @@ def test_pruning(started_cluster):
         "SELECT count() FROM `main.partitioned_cal` WHERE ts >= '2024-06-01 00:00:00' AND ts < '2024-06-02 00:00:00'",
         database="ducklake_sqlite2",
     )
-    assert node.grep_in_log("DuckLake: pruned 17 of 18 files")
+    # calendar transforms prune at the catalog listing itself (SQL pushdown):
+    # the in-memory pruner then has nothing left to prune.
+    assert node.grep_in_log("DuckLake: partition pushdown selected 1 files")
     node.query("SELECT count() FROM `main.partitioned_cal` WHERE ts < '2024-01-01 00:00:00'", database="ducklake_sqlite2")
-    assert node.grep_in_log("DuckLake: pruned 14 of 18 files")
+    assert node.grep_in_log("DuckLake: partition pushdown selected 4 files")
     node.query("SELECT count() FROM `main.partitioned_cal` WHERE toMonth(ts) = 6", database="ducklake_sqlite2")
-    assert node.grep_in_log("DuckLake: pruned 14 of 18 files")
+    assert node.grep_in_log("DuckLake: partition pushdown selected 4 files")
 
 
 def test_requires_experimental_setting(started_cluster):
@@ -618,7 +620,7 @@ def test_ducklake_write_partitioned(started_cluster):
     node.query(
         "SELECT count() FROM `main.partitioned` WHERE year(dt) = 2025", database=db
     )
-    assert node.grep_in_log("DuckLake: pruned 6 of 7 files")
+    assert node.grep_in_log("DuckLake: partition pushdown selected 1 files")
 
     # year/month/day transforms on a timestamptz column
     node.query(
@@ -635,7 +637,7 @@ def test_ducklake_write_partitioned(started_cluster):
     node.query(
         "SELECT count() FROM `main.partitioned_cal` WHERE toYear(ts) = 2025", database=db
     )
-    assert node.grep_in_log("DuckLake: pruned 18 of 19 files")
+    assert node.grep_in_log("DuckLake: partition pushdown selected 1 files")
 
     # rows spanning several partitions of one insert land in one file per partition
     node.query(

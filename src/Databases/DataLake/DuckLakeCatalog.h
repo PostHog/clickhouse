@@ -156,6 +156,17 @@ struct DuckLakeTableSnapshotInfo
 /// Which side-table reads DuckLakeCatalog::getDataFiles should do. On a busy catalog
 /// these tables are the largest in the schema, so callers scope them to what they can
 /// actually use.
+/// One SQL-pushdown partition constraint: a calendar bucket range on one partition
+/// transform of one source column (e.g. year(_inserted_at) in [2026, 2026]). Ranges
+/// are inclusive; a nullopt side is unbounded.
+struct DuckLakePartitionConstraint
+{
+    Int64 column_id;
+    String transform; /// year | month | day
+    std::optional<int64_t> lo;
+    std::optional<int64_t> hi;
+};
+
 struct DuckLakeListingOptions
 {
     /// Per-column min/max stats to read: nullopt = all columns (default), empty =
@@ -166,6 +177,14 @@ struct DuckLakeListingOptions
     /// partition-prune, e.g. unfiltered scans). Missing values never cause wrong
     /// pruning, only less.
     bool fetch_partition_values = true;
+    /// SQL-level partition pruning: when non-empty and applicable (every visible
+    /// partition spec of the table maps each constraint to the same partition key
+    /// index), the listing first resolves the surviving data_file_id set via
+    /// ducklake_file_partition_value and restricts the main listing query to it.
+    /// This is what keeps a partition-pruned query on a 10^7-file table from
+    /// listing every file in the table. The in-memory pruner still runs afterwards
+    /// as the exact filter.
+    std::vector<DuckLakePartitionConstraint> partition_constraints;
 };
 
 class DuckLakeCatalog : public DataLake::ICatalog

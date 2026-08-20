@@ -19,6 +19,7 @@
 #include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeInlinedValues.h>
 #include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakePositionalDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakePruning.h>
+#include <Poco/String.h>
 #include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeWrites.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
 #include <Storages/ObjectStorage/StorageObjectStorageConfiguration.h>
@@ -435,6 +436,42 @@ ObjectIterator DuckLakeMetadata::iterate(
     DuckLakeListingOptions options;
     options.stats_column_ids = pruner.minMaxColumnIds();
     options.fetch_partition_values = pruner.hasFilter();
+
+    /// SQL-level partition pruning: hand the listing the calendar bucket constraints the
+    /// pruner derived for the table's partition source columns. On a multi-million-file
+    /// table this is what keeps a partition-pruned query from listing every file. The
+    /// current spec only enumerates candidate (column, transform) pairs; the listing
+    /// re-resolves them against the snapshot-visible specs, so a stale hint can never
+    /// mis-prune. Bucket ranges come from the pruner, i.e. from the filter itself.
+    if (pruner.hasFilter())
+    {
+        const auto current_spec = catalog->getCurrentPartitionSpec(table_id, snapshot_id);
+        for (const auto & field : current_spec.fields)
+        {
+            const auto type_it = column_types_by_id.find(field.column_id);
+            if (type_it == column_types_by_id.end())
+                continue;
+            const auto transform = Poco::toLower(field.transform);
+            const auto & constraints = pruner.getCalendarConstraints(type_it->second.name, type_it->second.type);
+            const DuckLake::BucketRange * range = nullptr;
+            if (transform == "year")
+                range = &constraints.year;
+            else if (transform == "month")
+                range = &constraints.month;
+            else if (transform == "day")
+                range = &constraints.day;
+            else
+                continue;
+            if (!range->lo.has_value() && !range->hi.has_value())
+                continue;
+            options.partition_constraints.push_back(DuckLakePartitionConstraint{
+                .column_id = field.column_id,
+                .transform = transform,
+                .lo = range->lo.has_value() ? std::optional<int64_t>(*range->lo) : std::nullopt,
+                .hi = range->hi.has_value() ? std::optional<int64_t>(*range->hi) : std::nullopt,
+            });
+        }
+    }
 
     auto listing = catalog->getDataFiles(*snapshot_read->conn, table_id, snapshot_id, options);
 

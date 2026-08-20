@@ -75,6 +75,11 @@ public:
     /// filter has no usable conditions — the catalog's stats read can be skipped).
     std::vector<Int64> minMaxColumnIds() const;
 
+    /// Calendar bucket constraints derived from the filter for one source column
+    /// (function-form predicates merged with source-column ranges). Exposed for
+    /// SQL-level partition pruning in the catalog listing; canBePruned uses it too.
+    const CalendarConstraints & getCalendarConstraints(const String & column_name, const DataTypePtr & column_type) const;
+
     /// False only when there is no filter at all; then per-file partition values can
     /// never prune and the catalog read of them can be skipped.
     bool hasFilter() const { return filter_dag != nullptr; }
@@ -118,7 +123,6 @@ private:
     /// column. Columns whose type cannot produce unambiguous buckets (timestamps
     /// without an explicit timezone) yield no constraints.
     mutable std::unordered_map<String, CalendarConstraints> source_range_constraints;
-    const CalendarConstraints & getCalendarConstraints(const String & column_name, const DataTypePtr & column_type) const;
 };
 
 }

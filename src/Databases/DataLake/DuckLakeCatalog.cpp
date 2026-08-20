@@ -1299,19 +1299,160 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(IDuckLakeConnection & conn, In
 {
     DuckLakeFileListing listing;
 
+    /// Partition specs come first: SQL-level partition pruning below maps its constraints
+    /// to partition key indexes through them, and files reference them by partition_id.
+    const auto partition_specs = conn.exec(fmt::format(
+        "SELECT pc.partition_id, pc.partition_key_index, pc.column_id, pc.transform "
+        "FROM {0} pc "
+        "JOIN {1} pi ON pi.partition_id = pc.partition_id AND {2} "
+        "WHERE pc.table_id = {3} "
+        "ORDER BY pc.partition_id, pc.partition_key_index",
+        conn.qualified("ducklake_partition_column"),
+        conn.qualified("ducklake_partition_info"),
+        visibilityPredicate(snapshot_id, "pi"),
+        table_id));
+    for (const auto & row : partition_specs.rows)
+    {
+        const Int64 partition_id = parseInt64(row[0], "partition_id");
+        listing.partition_specs[partition_id].push_back(DuckLakePartitionField{
+            .partition_key_index = parseInt64(row[1], "partition_key_index"),
+            .column_id = parseInt64(row[2], "column_id"),
+            .transform = row[3].value_or(""),
+        });
+    }
+
+    /// SQL-level partition pruning. On a table with ~10^7 visible files the unpruned
+    /// listing is the dominant query cost (and its side reads used to be hours of random
+    /// IO), so resolve the surviving data_file_id set up front: a constraint is
+    /// applicable when EVERY visible spec of the table maps (column_id, transform) to the
+    /// same partition key index — then the surviving ids are one indexed range read per
+    /// constraint, intersected here. The main listing is restricted to the survivors
+    /// (bounded, below); the in-memory pruner still runs as the exact filter afterwards.
+    String survivor_restriction;
+    if (!options.partition_constraints.empty() && !listing.partition_specs.empty())
+    {
+        std::unordered_set<Int64> survivors;
+        bool any_applicable = false;
+        bool aborted = false;
+        for (const auto & constraint : options.partition_constraints)
+        {
+            /// Find the key index this constraint maps to in every visible spec.
+            std::optional<Int64> key_index;
+            bool applicable = true;
+            for (const auto & [partition_id, fields] : listing.partition_specs)
+            {
+                std::optional<Int64> spec_key;
+                for (const auto & field : fields)
+                {
+                    if (field.column_id == constraint.column_id && Poco::toLower(field.transform) == constraint.transform)
+                    {
+                        if (spec_key.has_value())
+                        {
+                            applicable = false; /// duplicate mapping inside one spec
+                            break;
+                        }
+                        spec_key = field.partition_key_index;
+                    }
+                }
+                if (!applicable || !spec_key.has_value())
+                {
+                    applicable = false;
+                    break;
+                }
+                if (!key_index.has_value())
+                    key_index = spec_key;
+                else if (*key_index != *spec_key)
+                {
+                    applicable = false; /// key index drift between specs
+                    break;
+                }
+            }
+            if (!applicable)
+                continue;
+
+            String condition = fmt::format(
+                "table_id = {} AND partition_key_index = {}", table_id, *key_index);
+            if (constraint.lo.has_value())
+                condition += fmt::format(" AND CAST(partition_value AS BIGINT) >= {}", *constraint.lo);
+            if (constraint.hi.has_value())
+                condition += fmt::format(" AND CAST(partition_value AS BIGINT) <= {}", *constraint.hi);
+
+            const auto rows = conn.exec(fmt::format(
+                "SELECT data_file_id FROM {} WHERE {}",
+                conn.qualified("ducklake_file_partition_value"),
+                condition));
+
+            if (!any_applicable)
+            {
+                any_applicable = true;
+                survivors.reserve(rows.rows.size());
+                for (const auto & row : rows.rows)
+                    survivors.insert(parseInt64(row[0], "data_file_id"));
+            }
+            else
+            {
+                std::unordered_set<Int64> keep;
+                keep.reserve(survivors.size());
+                for (const auto & row : rows.rows)
+                {
+                    const Int64 id = parseInt64(row[0], "data_file_id");
+                    if (survivors.contains(id))
+                        keep.insert(id);
+                }
+                survivors = std::move(keep);
+            }
+            /// An empty intersection can never grow again; stop early.
+            if (survivors.empty())
+                break;
+            /// Beyond the cap the IN-list restriction costs more than it saves (the
+            /// in-memory pruner still applies); bail out of pushdown entirely.
+            static constexpr size_t pushdown_survivor_cap = 500000;
+            if (survivors.size() > pushdown_survivor_cap)
+            {
+                aborted = true;
+                break;
+            }
+        }
+
+        if (any_applicable && !aborted)
+        {
+            LOG_DEBUG(
+                getLogger("DuckLakeCatalog"),
+                "DuckLake: partition pushdown selected {} files of table (id {}) at snapshot {}",
+                survivors.size(),
+                table_id,
+                snapshot_id);
+            if (survivors.empty())
+                return listing; /// provably no visible files match the filter
+
+            std::vector<Int64> ids(survivors.begin(), survivors.end());
+            std::sort(ids.begin(), ids.end());
+            String in_list = "(";
+            for (size_t i = 0; i < ids.size(); ++i)
+            {
+                if (i > 0)
+                    in_list += ',';
+                in_list += std::to_string(ids[i]);
+            }
+            in_list += ")";
+            survivor_restriction = fmt::format(" AND data.data_file_id IN {}", in_list);
+        }
+    }
+
     const auto data_files = conn.exec(fmt::format(
         "SELECT data.data_file_id, data.path, data.path_is_relative, data.record_count, data.file_size_bytes, "
         "data.encryption_key, data.mapping_id, data.file_format, data.partition_id, "
         "del.path, del.path_is_relative, del.format, del.delete_count, del.encryption_key "
         "FROM {0} data "
         "LEFT JOIN {1} del ON del.data_file_id = data.data_file_id AND {2} "
-        "WHERE data.table_id = {3} AND {4} "
+        "WHERE data.table_id = {3} AND {4}{5} "
         "ORDER BY data.data_file_id",
         conn.qualified("ducklake_data_file"),
         conn.qualified("ducklake_delete_file"),
         visibilityPredicate(snapshot_id, "del"),
         table_id,
-        visibilityPredicate(snapshot_id, "data")));
+        visibilityPredicate(snapshot_id, "data"),
+        survivor_restriction));
 
     for (const auto & row : data_files.rows)
     {
@@ -1490,26 +1631,6 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(IDuckLakeConnection & conn, In
                 it->partition_values[partition_key_index] = row[2];
             }
         }
-    }
-
-    const auto partition_specs = conn.exec(fmt::format(
-        "SELECT pc.partition_id, pc.partition_key_index, pc.column_id, pc.transform "
-        "FROM {0} pc "
-        "JOIN {1} pi ON pi.partition_id = pc.partition_id AND {2} "
-        "WHERE pc.table_id = {3} "
-        "ORDER BY pc.partition_id, pc.partition_key_index",
-        conn.qualified("ducklake_partition_column"),
-        conn.qualified("ducklake_partition_info"),
-        visibilityPredicate(snapshot_id, "pi"),
-        table_id));
-    for (const auto & row : partition_specs.rows)
-    {
-        const Int64 partition_id = parseInt64(row[0], "partition_id");
-        listing.partition_specs[partition_id].push_back(DuckLakePartitionField{
-            .partition_key_index = parseInt64(row[1], "partition_key_index"),
-            .column_id = parseInt64(row[2], "column_id"),
-            .transform = row[3].value_or(""),
-        });
     }
 
     /// Name mappings for files added via ducklake_add_data_files (mapping_id NOT NULL).
