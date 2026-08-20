@@ -37,6 +37,8 @@
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeDataObjectInfo.h>
+#include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeInlinedDataSource.h>
+#include <Processors/Chunk.h>
 #include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeMetadata.h>
 #include <Storages/ObjectStorage/Utils.h>
 #include <Storages/VirtualColumnUtils.h>
@@ -580,6 +582,53 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         if (!object_info || object_info->getPath().empty())
             return {};
+
+        /// Count-only on a DuckLake file: the catalog already carried its exact record
+        /// count and delete counts in the listing/task — answer without opening the
+        /// parquet footer (a full-table count over a big catalog is otherwise one S3
+        /// range read per file).
+        if (need_only_count)
+        {
+            if (const auto * ducklake_object = dynamic_cast<DuckLakeDataObjectInfo *>(object_info.get());
+                ducklake_object && ducklake_object->inlined_table_name.empty() && ducklake_object->record_count.has_value())
+            {
+                Int64 count = *ducklake_object->record_count;
+                for (const auto & delete_file : ducklake_object->positional_delete_files)
+                    count -= delete_file.delete_count;
+                count -= static_cast<Int64>(ducklake_object->inlined_deleted_positions.size());
+                if (count < 0)
+                    count = 0;
+
+                /// Tasks arriving from another replica carry no object metadata (files
+                /// re-fetch it lazily, which this path deliberately skips).
+                if (!object_info->getObjectMetadata())
+                {
+                    ObjectMetadata placeholder_metadata;
+                    placeholder_metadata.size_bytes = 0;
+                    placeholder_metadata.is_size_known = true;
+                    object_info->setObjectMetadata(placeholder_metadata);
+                }
+
+                LOG_DEBUG(
+                    log,
+                    "DuckLake: answering count for file '{}' from catalog record count ({} rows), skipping footer read",
+                    object_info->getPath(),
+                    count);
+
+                std::vector<Chunk> chunks;
+                if (!read_from_format_info.source_header.getColumns().empty())
+                    chunks.push_back(cloneConstWithDefault(
+                        Chunk{read_from_format_info.source_header.getColumns(), 0}, static_cast<UInt64>(count)));
+                else
+                    chunks.emplace_back(Columns{}, static_cast<UInt64>(count));
+                auto source = std::make_shared<DuckLakeInlinedDataSource>(
+                    std::make_shared<const Block>(read_from_format_info.source_header), std::move(chunks));
+                Pipe pipe(source);
+                auto pipeline = std::make_unique<QueryPipeline>(std::move(pipe));
+                auto pulling = std::make_unique<PullingPipelineExecutor>(*pipeline);
+                return ReaderHolder(object_info, nullptr, std::move(source), std::move(pipeline), std::move(pulling));
+            }
+        }
 
         /// A synthetic DuckLake inlined-data object is not a file: read its rows from
         /// the catalog (via the lake metadata at the pinned snapshot) instead of

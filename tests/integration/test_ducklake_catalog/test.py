@@ -1034,6 +1034,20 @@ def test_ducklake_count_from_metadata(started_cluster):
     # the metadata path was taken (logged at the read step)
     assert node.grep_in_log("Answering count from catalog metadata")
 
+    # distributed counts also skip footer reads: each assigned file's count comes
+    # from the catalog record/delete counts carried in the task
+    for instance in (node, node2):
+        create_parallel_fresh_db_on(instance)
+    assert (
+        node.query(
+            "SELECT count() FROM `main.with_deletes`",
+            database="ducklake_par",
+            settings=PARALLEL_REPLICAS_SETTINGS,
+        )
+        == "2\n"
+    )
+    assert node2.grep_in_log("from catalog record count") or node.grep_in_log("from catalog record count")
+
 
 def test_ducklake_count_from_metadata_parallel_replicas(started_cluster):
     """The metadata count path engages on the parallel-replicas initiator and returns
