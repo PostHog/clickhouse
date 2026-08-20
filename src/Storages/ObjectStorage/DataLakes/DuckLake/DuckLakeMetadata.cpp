@@ -637,13 +637,44 @@ String DuckLakeMetadata::toObjectPath(const String & path, bool path_is_relative
     else
     {
         const String fs_path = stripScheme(path);
-        if (!fs_path.starts_with(catalog_table_path + "/"))
-            throw Exception(
-                ErrorCodes::BAD_ARGUMENTS,
-                "DuckLake file '{}' is located outside of the table data path '{}'; reading such files is not supported",
-                path,
-                catalog_table_path);
-        relative = fs_path.substr(catalog_table_path.size() + 1);
+        if (fs_path.starts_with(catalog_table_path + "/"))
+            relative = fs_path.substr(catalog_table_path.size() + 1);
+        else
+        {
+            /// Files registered outside the table's declared data path — the
+            /// ducklake_add_data_files backfill flow does this (e.g. a `backfill/`
+            /// prefix next to the table prefix) — are readable as long as they live
+            /// in the same storage namespace (S3 bucket / filesystem root). The
+            /// in-path mapping above re-bases catalog_table_path onto
+            /// storage_table_path, so the namespace prefix is the part of
+            /// catalog_table_path ahead of storage_table_path ('bucket' for S3,
+            /// empty for local storage where both are the same absolute path).
+            String namespace_prefix;
+            if (catalog_table_path == storage_table_path)
+                namespace_prefix = "";
+            else if (storage_table_path.empty() || !catalog_table_path.ends_with("/" + storage_table_path))
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "DuckLake file '{}' is located outside of the table data path '{}' and the storage namespace "
+                    "prefix cannot be determined from storage path '{}'",
+                    path,
+                    catalog_table_path,
+                    storage_table_path);
+            else
+                namespace_prefix = catalog_table_path.substr(0, catalog_table_path.size() - storage_table_path.size() - 1);
+
+            const String prefix_with_sep = namespace_prefix.empty() ? "" : namespace_prefix + "/";
+            if (!fs_path.starts_with(prefix_with_sep))
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "DuckLake file '{}' is located outside of the table data path '{}' and outside the storage "
+                    "namespace '{}'; cross-namespace (e.g. cross-bucket) reads are not supported",
+                    path,
+                    catalog_table_path,
+                    namespace_prefix);
+            relative = fs_path.substr(prefix_with_sep.size());
+            return relative;
+        }
     }
     return storage_table_path + "/" + relative;
 }

@@ -1116,8 +1116,8 @@ def test_ducklake_postgres_password_env(started_cluster):
         settings={"allow_experimental_database_ducklake_catalog": 1},
     )
     assert (
-        node.query("SELECT count() FROM `main.inlined_mixed`", database="ducklake_pg_pwenv")
-        == "101\n"
+        node.query("SELECT count() FROM `main.plain`", database="ducklake_pg_pwenv")
+        == "3\n"
     )
     node.query("DROP DATABASE ducklake_pg_pwenv SYNC")
 
@@ -1134,3 +1134,35 @@ def test_ducklake_postgres_password_env(started_cluster):
     except QueryRuntimeException as e:
         assert "password_env" in str(e)
         assert "DUCKLAKE_DEFINITELY_MISSING_PASSWORD_VAR" in str(e)
+
+
+def test_ducklake_out_of_path_data_file(started_cluster):
+    # ducklake_add_data_files-style backfills register files OUTSIDE the table's declared
+    # data path (absolute path, same storage namespace) — the reader must rebase them onto
+    # the namespace root instead of rejecting them. Registers a copy of main.plain's file
+    # at a backfill/ prefix, reads it back, then unregisters.
+    src = "/var/lib/clickhouse/user_files/ducklake_data/main/plain/ducklake-019f71da-a16b-7ecb-bc85-579cdf80b3af.parquet"
+    dst = "/var/lib/clickhouse/user_files/ducklake_data/backfill/plain-copy.parquet"
+    node.exec_in_container(["bash", "-c", f"mkdir -p $(dirname {dst}) && cp {src} {dst}"])
+    pg = cluster.get_instance_docker_id("postgres1")
+    create_postgres_db()
+    register = (
+        "INSERT INTO ducklake_data_file (data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path, path_is_relative, file_format, record_count, file_size_bytes, footer_size, row_id_start, partition_id, encryption_key, mapping_id, partial_max) "
+        f"VALUES (1000, 1, 17, NULL, NULL, '{dst}', FALSE, 'parquet', 3, 309, 220, 1000, NULL, NULL, NULL, NULL); "
+        "INSERT INTO ducklake_file_column_stats (data_file_id, table_id, column_id, column_size_bytes, value_count, null_count, min_value, max_value, contains_nan, extra_stats) VALUES "
+        "(1000, 1, 1, 37, 3, 0, '1', '3', NULL, NULL), (1000, 1, 2, 40, 3, 0, 'a', 'c', NULL, NULL);"
+    )
+    try:
+        run_and_check([f'docker exec {pg} psql -U postgres -d postgres -c "{register}"'], shell=True)
+        # sum() forces real file reads (a catalog-only count() would not prove the mapping)
+        assert (
+            node.query("SELECT sum(id) FROM `main.plain`", database="ducklake_pg") == "12\n"
+        )
+    finally:
+        run_and_check(
+            [
+                f'docker exec {pg} psql -U postgres -d postgres -c "DELETE FROM ducklake_file_column_stats WHERE data_file_id = 1000; DELETE FROM ducklake_data_file WHERE data_file_id = 1000;"'
+            ],
+            shell=True,
+        )
+        node.exec_in_container(["rm", "-f", dst])
