@@ -1370,6 +1370,12 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(IDuckLakeConnection & conn, In
             if (!applicable)
                 continue;
 
+            /// The cap is enforced in SQL: an unselective constraint must not
+            /// materialize millions of ids (and the hash set) before being noticed.
+            /// LIMIT cap+1 is the overflow signal; no ORDER BY — any superset of the
+            /// cap proves unselectivity, the subset itself is discarded.
+            static constexpr size_t pushdown_survivor_cap = 500000;
+
             String condition = fmt::format(
                 "table_id = {} AND partition_key_index = {}", table_id, *key_index);
             if (constraint.lo.has_value())
@@ -1378,9 +1384,18 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(IDuckLakeConnection & conn, In
                 condition += fmt::format(" AND CAST(partition_value AS BIGINT) <= {}", *constraint.hi);
 
             const auto rows = conn.exec(fmt::format(
-                "SELECT data_file_id FROM {} WHERE {}",
+                "SELECT data_file_id FROM {} WHERE {} LIMIT {}",
                 conn.qualified("ducklake_file_partition_value"),
-                condition));
+                condition,
+                pushdown_survivor_cap + 1));
+
+            if (rows.rows.size() > pushdown_survivor_cap)
+            {
+                /// Unselective: the IN-list restriction would cost more than it saves
+                /// (the in-memory pruner still applies); bail out of pushdown entirely.
+                aborted = true;
+                break;
+            }
 
             if (!any_applicable)
             {
@@ -1404,14 +1419,6 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(IDuckLakeConnection & conn, In
             /// An empty intersection can never grow again; stop early.
             if (survivors.empty())
                 break;
-            /// Beyond the cap the IN-list restriction costs more than it saves (the
-            /// in-memory pruner still applies); bail out of pushdown entirely.
-            static constexpr size_t pushdown_survivor_cap = 500000;
-            if (survivors.size() > pushdown_survivor_cap)
-            {
-                aborted = true;
-                break;
-            }
         }
 
         if (any_applicable && !aborted)
